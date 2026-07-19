@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.0 — 2026-07-19
+
+### Added
+
+- **Selective unpack** — `rzc unpack archive.rzst --only path/in/archive -o out/`
+- **`--strip-components N`** on unpack (like `tar --strip-components`)
+- **`rzc cat archive.rzst path/inside`** — decompress one pack member (or a single-file archive) to stdout
+- **`rzc diff a.rzst b.rzst`** — compare member lists and checksums (pack) or single-file hashes; exit 1 on differences
+- **`--force`** — require explicit overwrite for compress/pack outputs and unpack destinations that already exist
+- **`--newer-than DAYS`** on pack — only include files modified within the last N days
+- **Solid pack progress** — multi-file progress bar by file count (`N/M files`)
+- **Compression ratio table** after recursive compress (per-file + TOTAL)
+- **Shell completions** — `rzc completions bash|zsh|fish|powershell|elvish` via `clap_complete`
+- Library APIs: `unpack_archive_opts`, `pack_directory_opts`, `cat_member`, `extract_pack_member`, `diff_archives`, `compress_file_opts`, `strip_path_components`, `UnpackOpts`, `PackOpts`, `DiffResult`
+- Tests for only, strip-components, diff, cat, force, newer-than
+
+### Changed
+
+- Version bumped to **0.4.0**
+- Compress/pack refuse to overwrite an existing output path without `--force`
+- Unpack refuses to overwrite an existing member file without `--force` (or `--skip-existing` to leave it)
+
+### Notes
+
+- v1/v2 single-file and v3 pack formats remain fully compatible
+- Append/update-in-place pack was deferred (format stores file count up front)
+
 ## 0.3.0 — 2026-07-19
 
 ### Added
