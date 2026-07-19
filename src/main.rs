@@ -7,14 +7,17 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, Shell};
 use indicatif::{ProgressBar, ProgressStyle};
 use rust_file_compressor::{
-    append_suffix, bytes_per_second, compress_bytes, compress_dir_recursive_ex, compress_file,
-    compress_file_dry_run, compress_to_path, decompress_dir_recursive_ex, decompress_file_opts,
-    decompress_reader, decompress_to_path, default_decompressed_path, display_bytes, doctor,
-    inspect_file, is_stdio_path, list_archive, pack_directory, ratio_percent, resolve_threads,
-    unpack_archive, verify_file, ArchiveInfo, IoStats, ListResult, PackInfo, Preset, DEFAULT_LEVEL,
+    append_suffix, bytes_per_second, cat_member, compress_bytes, compress_dir_recursive_ex,
+    compress_file_dry_run, compress_file_opts, compress_to_path, decompress_dir_recursive_ex,
+    decompress_file_opts, decompress_reader, decompress_to_path, default_decompressed_path,
+    diff_archives, display_bytes, doctor, inspect_file, is_stdio_path, list_archive,
+    pack_directory_opts, ratio_percent, resolve_threads, unpack_archive_opts, verify_file,
+    ArchiveInfo, DiffResult, DiffStatus, IoStats, ListResult, PackInfo, PackOpts, Preset,
+    UnpackOpts, DEFAULT_LEVEL,
 };
 use serde::Serialize;
 
@@ -81,6 +84,10 @@ enum Commands {
         /// Glob patterns to exclude when using --recursive (repeatable).
         #[arg(long = "exclude", value_name = "GLOB")]
         excludes: Vec<String>,
+
+        /// Overwrite existing output files.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Decompress a .rzst file (or directory with --recursive).
@@ -99,6 +106,10 @@ enum Commands {
         /// Skip writing if the output path already exists.
         #[arg(long)]
         skip_existing: bool,
+
+        /// Overwrite existing output files (default behaviour when not skipping).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Pack a directory into a multi-file v3 archive.
@@ -126,6 +137,14 @@ enum Commands {
         #[arg(long = "exclude", value_name = "GLOB")]
         excludes: Vec<String>,
 
+        /// Only pack files modified within the last N days.
+        #[arg(long = "newer-than", value_name = "DAYS")]
+        newer_than: Option<u64>,
+
+        /// Overwrite existing output archive.
+        #[arg(long)]
+        force: bool,
+
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -144,9 +163,47 @@ enum Commands {
         #[arg(long)]
         skip_existing: bool,
 
+        /// Extract only this archive member path.
+        #[arg(long = "only", value_name = "PATH")]
+        only: Option<String>,
+
+        /// Strip N leading path components from member paths.
+        #[arg(long = "strip-components", value_name = "N", default_value_t = 0)]
+        strip_components: u32,
+
+        /// Overwrite existing member files (required when a destination exists).
+        #[arg(long)]
+        force: bool,
+
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Write one archive member (or a single-file archive) to stdout.
+    Cat {
+        /// .rzst archive.
+        archive: PathBuf,
+
+        /// Member path inside a v3 pack (optional for single-file archives).
+        member: Option<String>,
+    },
+
+    /// Compare two archives by member paths and checksums.
+    Diff {
+        /// First archive.
+        archive_a: PathBuf,
+
+        /// Second archive.
+        archive_b: PathBuf,
+
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Exit 0 even when archives differ (default: exit 1 on differences).
+        #[arg(long)]
+        quiet: bool,
     },
 
     /// List members / metadata of a single-file or pack archive.
@@ -180,6 +237,12 @@ enum Commands {
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Generate shell completion scripts.
+    Completions {
+        /// Shell to generate completions for.
+        shell: Shell,
     },
 
     /// Compare this compressor against zip -9 on one input file.
@@ -239,6 +302,7 @@ fn main() -> Result<()> {
             recursive,
             dry_run,
             excludes,
+            force,
         } => {
             let level = resolve_level(level, preset);
             let threads = resolve_threads(threads);
@@ -250,6 +314,7 @@ fn main() -> Result<()> {
                 recursive,
                 dry_run,
                 &excludes,
+                force,
             )?;
         }
         Commands::Decompress {
@@ -257,8 +322,15 @@ fn main() -> Result<()> {
             output,
             recursive,
             skip_existing,
+            force,
         } => {
-            run_decompress(&input, output.as_deref(), recursive, skip_existing)?;
+            run_decompress(
+                &input,
+                output.as_deref(),
+                recursive,
+                skip_existing,
+                force,
+            )?;
         }
         Commands::Pack {
             input,
@@ -267,19 +339,52 @@ fn main() -> Result<()> {
             preset,
             threads,
             excludes,
+            newer_than,
+            force,
             json,
         } => {
             let level = resolve_level(level, preset);
             let threads = resolve_threads(threads);
-            run_pack(&input, output.as_deref(), level, threads, &excludes, json)?;
+            run_pack(
+                &input,
+                output.as_deref(),
+                level,
+                threads,
+                &excludes,
+                newer_than,
+                force,
+                json,
+            )?;
         }
         Commands::Unpack {
             input,
             output,
             skip_existing,
+            only,
+            strip_components,
+            force,
             json,
         } => {
-            run_unpack(&input, output.as_deref(), skip_existing, json)?;
+            run_unpack(
+                &input,
+                output.as_deref(),
+                skip_existing,
+                only.as_deref(),
+                strip_components,
+                force,
+                json,
+            )?;
+        }
+        Commands::Cat { archive, member } => {
+            run_cat(&archive, member.as_deref())?;
+        }
+        Commands::Diff {
+            archive_a,
+            archive_b,
+            json,
+            quiet,
+        } => {
+            run_diff(&archive_a, &archive_b, json, quiet)?;
         }
         Commands::List { input, json } => {
             run_list(&input, json)?;
@@ -292,6 +397,9 @@ fn main() -> Result<()> {
         }
         Commands::Doctor { json } => {
             run_doctor(json)?;
+        }
+        Commands::Completions { shell } => {
+            run_completions(shell)?;
         }
         Commands::Bench {
             input,
@@ -321,6 +429,7 @@ fn resolve_level(level: Option<i32>, preset: Option<PresetArg>) -> i32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_compress(
     input: &Path,
     output: Option<&Path>,
@@ -329,6 +438,7 @@ fn run_compress(
     recursive: bool,
     dry_run: bool,
     excludes: &[String],
+    force: bool,
 ) -> Result<()> {
     if recursive {
         if is_stdio_path(input) {
@@ -353,15 +463,7 @@ fn run_compress(
                 "Compressed"
             };
             println!("{verb} {} file(s) under {}", results.len(), input.display());
-            for s in &results {
-                println!(
-                    "  {} -> {} ({:.2}%)",
-                    display_bytes(s.input_bytes),
-                    display_bytes(s.output_bytes),
-                    ratio_percent(s.output_bytes, s.input_bytes)
-                );
-                println!("    {}", s.output_path.display());
-            }
+            print_ratio_table(&results);
         }
         return Ok(());
     }
@@ -425,6 +527,12 @@ fn run_compress(
         if is_stdio_path(output) {
             compress_stdio_to_stdio(level, threads)?;
         } else {
+            if output.exists() && !force {
+                bail!(
+                    "output already exists: {} (use --force to overwrite)",
+                    output.display()
+                );
+            }
             let stats = compress_to_path(io::stdin().lock(), output, level, threads, None)?;
             print_compress_stats(&stats, Duration::ZERO, false);
         }
@@ -467,13 +575,44 @@ fn run_compress(
         .map(|f| f as &rust_file_compressor::ProgressFn<'_>);
 
     let start = Instant::now();
-    let stats = compress_file(input, &output_path, level, threads, progress_ref)?;
+    let stats = compress_file_opts(input, &output_path, level, threads, force, progress_ref)?;
     let elapsed = start.elapsed();
     if let Some(bar) = pb {
         bar.finish_and_clear();
     }
     print_compress_stats(&stats, elapsed, true);
     Ok(())
+}
+
+/// Print per-file rows plus a totals / ratio summary table.
+fn print_ratio_table(results: &[IoStats]) {
+    let mut total_in: u64 = 0;
+    let mut total_out: u64 = 0;
+
+    println!(
+        "{:<10} {:>12} {:>12} {:>8}  path",
+        "status", "original", "compressed", "ratio"
+    );
+    for s in results {
+        total_in += s.input_bytes;
+        total_out += s.output_bytes;
+        println!(
+            "{:<10} {:>12} {:>12} {:>7.1}%  {}",
+            "ok",
+            display_bytes(s.input_bytes),
+            display_bytes(s.output_bytes),
+            ratio_percent(s.output_bytes, s.input_bytes),
+            s.output_path.display()
+        );
+    }
+    println!(
+        "{:<10} {:>12} {:>12} {:>7.1}%  ({} files)",
+        "TOTAL",
+        display_bytes(total_in),
+        display_bytes(total_out),
+        ratio_percent(total_out, total_in),
+        results.len()
+    );
 }
 
 fn compress_stdio_to_stdio(level: i32, threads: u32) -> Result<()> {
@@ -497,7 +636,9 @@ fn run_decompress(
     output: Option<&Path>,
     recursive: bool,
     skip_existing: bool,
+    force: bool,
 ) -> Result<()> {
+    let _ = force; // decompress always overwrites unless --skip-existing
     if recursive {
         if is_stdio_path(input) {
             bail!("--recursive cannot be used with stdin (-)");
@@ -607,12 +748,15 @@ fn run_decompress(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_pack(
     input: &Path,
     output: Option<&Path>,
     level: i32,
     threads: u32,
     excludes: &[String],
+    newer_than: Option<u64>,
+    force: bool,
     json: bool,
 ) -> Result<()> {
     if !input.is_dir() {
@@ -631,7 +775,44 @@ fn run_pack(
         name
     });
 
-    let stats = pack_directory(input, &output_path, level, threads, excludes)?;
+    // Count files first for a solid multi-file progress bar.
+    let pb = if !json && io::stderr().is_terminal() {
+        let bar = ProgressBar::new(0);
+        bar.set_style(
+            ProgressStyle::with_template(
+                "{msg} [{bar:40.cyan/blue}] {pos}/{len} files ({eta})",
+            )
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=>-"),
+        );
+        bar.set_message("packing");
+        Some(bar)
+    } else {
+        None
+    };
+    let progress = pb.as_ref().map(|bar| {
+        let bar = bar.clone();
+        move |done: u64, total: u64| {
+            if total > 0 {
+                bar.set_length(total);
+            }
+            bar.set_position(done);
+        }
+    });
+    let progress_ref = progress
+        .as_ref()
+        .map(|f| f as &rust_file_compressor::ProgressFn<'_>);
+
+    let opts = PackOpts {
+        excludes: excludes.to_vec(),
+        newer_than_days: newer_than,
+        force,
+    };
+    let stats = pack_directory_opts(input, &output_path, level, threads, &opts, progress_ref)?;
+    if let Some(bar) = pb {
+        bar.finish_and_clear();
+    }
+
     if json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {
@@ -650,7 +831,15 @@ fn run_pack(
     Ok(())
 }
 
-fn run_unpack(input: &Path, output: Option<&Path>, skip_existing: bool, json: bool) -> Result<()> {
+fn run_unpack(
+    input: &Path,
+    output: Option<&Path>,
+    skip_existing: bool,
+    only: Option<&str>,
+    strip_components: u32,
+    force: bool,
+    json: bool,
+) -> Result<()> {
     let output_dir = output.map(Path::to_path_buf).unwrap_or_else(|| {
         let text = input.to_string_lossy();
         if let Some(stripped) = text.strip_suffix(".rzst") {
@@ -660,7 +849,16 @@ fn run_unpack(input: &Path, output: Option<&Path>, skip_existing: bool, json: bo
         }
     });
 
-    let stats = unpack_archive(input, &output_dir, skip_existing)?;
+    // Without --force, refuse to overwrite existing member files (use --skip-existing
+    // to leave them alone, or --force to replace). New files always write fine.
+    let opts = UnpackOpts {
+        skip_existing,
+        only: only.map(|s| s.to_string()),
+        strip_components,
+        force,
+    };
+
+    let stats = unpack_archive_opts(input, &output_dir, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {
@@ -676,6 +874,73 @@ fn run_unpack(input: &Path, output: Option<&Path>, skip_existing: bool, json: bo
         }
     }
     Ok(())
+}
+
+fn run_cat(archive: &Path, member: Option<&str>) -> Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    let written = cat_member(archive, member, &mut handle)?;
+    // Only log to stderr so stdout stays clean for piping.
+    if io::stderr().is_terminal() {
+        eprintln!("Wrote {} to stdout", display_bytes(written));
+    }
+    Ok(())
+}
+
+fn run_diff(a: &Path, b: &Path, json: bool, quiet: bool) -> Result<()> {
+    let result = diff_archives(a, b)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print_diff(&result);
+    }
+    if !result.is_equal() && !quiet {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn print_diff(result: &DiffResult) {
+    println!(
+        "Comparing:\n  A: {}\n  B: {}",
+        result.archive_a.display(),
+        result.archive_b.display()
+    );
+    println!();
+    if result.is_equal() {
+        println!(
+            "Archives are identical ({} member(s))",
+            result.identical
+        );
+        return;
+    }
+    println!(
+        "{:<10} {:<40} detail",
+        "status", "path"
+    );
+    for e in &result.entries {
+        match e.status {
+            DiffStatus::Identical => continue,
+            DiffStatus::OnlyInA => {
+                println!("{:<10} {:<40} only in A", "only_a", truncate_display(&e.path, 40));
+            }
+            DiffStatus::OnlyInB => {
+                println!("{:<10} {:<40} only in B", "only_b", truncate_display(&e.path, 40));
+            }
+            DiffStatus::Changed => {
+                println!(
+                    "{:<10} {:<40} checksum differs",
+                    "changed",
+                    truncate_display(&e.path, 40)
+                );
+            }
+        }
+    }
+    println!();
+    println!(
+        "Summary: {} identical, {} changed, {} only in A, {} only in B",
+        result.identical, result.changed, result.only_in_a, result.only_in_b
+    );
 }
 
 fn run_list(input: &Path, json: bool) -> Result<()> {
@@ -697,7 +962,6 @@ fn run_list(input: &Path, json: bool) -> Result<()> {
 }
 
 fn run_info(input: &Path, json: bool) -> Result<()> {
-    // info works for both single and pack
     let result = list_archive(input)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -852,6 +1116,13 @@ fn run_doctor(json: bool) -> Result<()> {
     Ok(())
 }
 
+fn run_completions(shell: Shell) -> Result<()> {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    generate(shell, &mut cmd, name, &mut io::stdout());
+    Ok(())
+}
+
 fn print_compress_stats(stats: &IoStats, elapsed: Duration, show_time: bool) {
     println!(
         "Compressed {} -> {}",
@@ -996,7 +1267,7 @@ fn run_benchmark(
 
 fn timed_compress(input: &Path, output: &Path, level: i32, threads: u32) -> Result<TimedStats> {
     let start = Instant::now();
-    let stats = compress_file(input, output, level, threads, None)?;
+    let stats = compress_file_opts(input, output, level, threads, true, None)?;
     let elapsed = start.elapsed();
     Ok(TimedStats {
         output_bytes: stats.output_bytes,

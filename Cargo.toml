@@ -1,6 +1,6 @@
 [package]
 name = "rust-file-compressor"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "A fast Rust file compressor CLI with zstd compression, multi-file archives, integrity checks, and zip benchmarking."
 license = "MIT"
@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6.1", features = ["derive"] }
+clap_complete = "4"
 globset = "0.4"
 hex = "0.4"
 indicatif = "0.17"
@@ -29,4 +30,5 @@ walkdir = "2"
 zstd = { version = "0.13.3", features = ["zstdmt"] }
 
 [dev-dependencies]
+filetime = "0.2.29"
 tempfile = "3.23.0"

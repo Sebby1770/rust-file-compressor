@@ -5,9 +5,11 @@
 //! and helpers for CLI tooling.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, BufReader, BufWriter, Cursor, Read, Write},
     path::{Component, Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{bail, Context, Result};
@@ -210,6 +212,77 @@ pub struct UnpackStats {
     pub skipped: u32,
     #[serde(serialize_with = "serialize_path")]
     pub output_dir: PathBuf,
+}
+
+/// Options for unpacking a v3 pack archive.
+#[derive(Debug, Clone, Default)]
+pub struct UnpackOpts {
+    /// Skip members whose destination already exists.
+    pub skip_existing: bool,
+    /// Only extract the member with this exact archive path (if set).
+    pub only: Option<String>,
+    /// Strip this many leading path components (like `tar --strip-components`).
+    pub strip_components: u32,
+    /// Overwrite existing destination files. When false, existing files error
+    /// unless [`Self::skip_existing`] is true.
+    pub force: bool,
+}
+
+/// Options for packing a directory into a v3 archive.
+#[derive(Debug, Clone, Default)]
+pub struct PackOpts {
+    /// Glob patterns to exclude.
+    pub excludes: Vec<String>,
+    /// Only include files modified within the last N days.
+    pub newer_than_days: Option<u64>,
+    /// Overwrite the output archive if it already exists.
+    pub force: bool,
+}
+
+/// One side of an archive diff entry.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffStatus {
+    /// Present only in the first archive.
+    OnlyInA,
+    /// Present only in the second archive.
+    OnlyInB,
+    /// Same path in both, different checksum / content.
+    Changed,
+    /// Same path and same checksum.
+    Identical,
+}
+
+/// A single path comparison between two archives.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffEntry {
+    pub path: String,
+    pub status: DiffStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum_a: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum_b: Option<String>,
+}
+
+/// Result of comparing two archives.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffResult {
+    #[serde(serialize_with = "serialize_path")]
+    pub archive_a: PathBuf,
+    #[serde(serialize_with = "serialize_path")]
+    pub archive_b: PathBuf,
+    pub entries: Vec<DiffEntry>,
+    pub only_in_a: u32,
+    pub only_in_b: u32,
+    pub changed: u32,
+    pub identical: u32,
+}
+
+impl DiffResult {
+    /// True when both archives have the same members and checksums.
+    pub fn is_equal(&self) -> bool {
+        self.only_in_a == 0 && self.only_in_b == 0 && self.changed == 0
+    }
 }
 
 /// Doctor self-test result.
@@ -466,6 +539,9 @@ pub fn compress_file_dry_run(input: &Path, level: i32, threads: u32) -> Result<D
 }
 
 /// Compress a filesystem path to another path.
+///
+/// Overwrites `output` if it already exists. Prefer [`compress_file_opts`] to
+/// control overwrite behaviour.
 pub fn compress_file(
     input: &Path,
     output: &Path,
@@ -473,6 +549,27 @@ pub fn compress_file(
     threads: u32,
     progress: Option<&ProgressFn<'_>>,
 ) -> Result<IoStats> {
+    compress_file_opts(input, output, level, threads, true, progress)
+}
+
+/// Compress a filesystem path with overwrite control.
+///
+/// When `force` is false and `output` already exists, returns an error.
+pub fn compress_file_opts(
+    input: &Path,
+    output: &Path,
+    level: i32,
+    threads: u32,
+    force: bool,
+    progress: Option<&ProgressFn<'_>>,
+) -> Result<IoStats> {
+    if output.exists() && !force {
+        bail!(
+            "output already exists: {} (use --force to overwrite)",
+            output.display()
+        );
+    }
+
     let data = fs::read(input).with_context(|| format!("reading input {}", input.display()))?;
     let input_bytes = data.len() as u64;
 
@@ -858,6 +955,9 @@ pub fn verify_pack(path: &Path, progress: Option<&ProgressFn<'_>>) -> Result<u64
 ///   path_len(u32) path(utf8) original_len(u64) sha256(32)
 ///   compressed_len(u64) compressed_bytes
 /// ```
+///
+/// Overwrites `output` if it exists. Prefer [`pack_directory_opts`] for filters
+/// and overwrite control.
 pub fn pack_directory(
     dir: &Path,
     output: &Path,
@@ -865,11 +965,50 @@ pub fn pack_directory(
     threads: u32,
     excludes: &[String],
 ) -> Result<PackStats> {
+    pack_directory_opts(
+        dir,
+        output,
+        level,
+        threads,
+        &PackOpts {
+            excludes: excludes.to_vec(),
+            newer_than_days: None,
+            force: true,
+        },
+        None,
+    )
+}
+
+/// Pack a directory with filters, force, and optional progress.
+///
+/// Progress callback receives `(files_done, files_total)` — both are file
+/// counts (not bytes) so many small files show a solid overall bar.
+pub fn pack_directory_opts(
+    dir: &Path,
+    output: &Path,
+    level: i32,
+    threads: u32,
+    opts: &PackOpts,
+    progress: Option<&ProgressFn<'_>>,
+) -> Result<PackStats> {
     if !dir.is_dir() {
         bail!("{} is not a directory", dir.display());
     }
 
-    let exclude_set = build_exclude_set(excludes)?;
+    if output.exists() && !opts.force {
+        bail!(
+            "output already exists: {} (use --force to overwrite)",
+            output.display()
+        );
+    }
+
+    let exclude_set = build_exclude_set(&opts.excludes)?;
+    let mtime_cutoff = opts.newer_than_days.map(|days| {
+        SystemTime::now()
+            .checked_sub(Duration::from_secs(days.saturating_mul(24 * 60 * 60)))
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    });
+
     let mut files: Vec<(String, PathBuf)> = Vec::new();
 
     for entry in WalkDir::new(dir).follow_links(false).sort_by_file_name() {
@@ -885,7 +1024,14 @@ pub fn pack_directory(
         if is_excluded(&rel_str, &exclude_set) {
             continue;
         }
-        // Skip nested .rzst by default? Keep them — user may want to pack archives.
+        if let Some(cutoff) = mtime_cutoff {
+            let modified = fs::metadata(abs)
+                .and_then(|m| m.modified())
+                .with_context(|| format!("reading mtime for {}", abs.display()))?;
+            if modified < cutoff {
+                continue;
+            }
+        }
         files.push((rel_str, abs.to_path_buf()));
     }
 
@@ -894,6 +1040,11 @@ pub fn pack_directory(
     }
     if files.len() > u32::MAX as usize {
         bail!("too many files to pack");
+    }
+
+    let total_files = files.len() as u64;
+    if let Some(cb) = progress {
+        cb(0, total_files);
     }
 
     ensure_parent_dir(output)?;
@@ -907,7 +1058,7 @@ pub fn pack_directory(
     writer.write_all(&(files.len() as u32).to_le_bytes())?;
 
     let mut original_bytes: u64 = 0;
-    for (rel_path, abs_path) in &files {
+    for (idx, (rel_path, abs_path)) in files.iter().enumerate() {
         let data = fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
         let checksum = sha256(&data);
         let compressed = zstd_compress_raw(&data, level, threads)?;
@@ -924,6 +1075,9 @@ pub fn pack_directory(
         writer.write_all(&compressed)?;
 
         original_bytes += data.len() as u64;
+        if let Some(cb) = progress {
+            cb((idx as u64) + 1, total_files);
+        }
     }
 
     writer.flush()?;
@@ -941,11 +1095,29 @@ pub fn pack_directory(
     })
 }
 
-/// Unpack a v3 archive into `output_dir`.
+/// Unpack a v3 archive into `output_dir` (overwrites existing members).
 pub fn unpack_archive(
     archive: &Path,
     output_dir: &Path,
     skip_existing: bool,
+) -> Result<UnpackStats> {
+    unpack_archive_opts(
+        archive,
+        output_dir,
+        &UnpackOpts {
+            skip_existing,
+            only: None,
+            strip_components: 0,
+            force: true,
+        },
+    )
+}
+
+/// Unpack with selective extract, strip-components, and force control.
+pub fn unpack_archive_opts(
+    archive: &Path,
+    output_dir: &Path,
+    opts: &UnpackOpts,
 ) -> Result<UnpackStats> {
     let file = File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
     let mut reader = BufReader::new(file);
@@ -975,6 +1147,7 @@ pub fn unpack_archive(
     let mut members = Vec::with_capacity(file_count as usize);
     let mut written = 0_u32;
     let mut skipped = 0_u32;
+    let mut matched_only = false;
 
     for _ in 0..file_count {
         let mut path_len_buf = [0_u8; 4];
@@ -1000,8 +1173,15 @@ pub fn unpack_archive(
             .read_exact(&mut compressed)
             .with_context(|| format!("reading compressed data for {member_path}"))?;
 
-        let dest = safe_join(output_dir, &member_path)?;
-        if skip_existing && dest.exists() {
+        if let Some(only) = &opts.only {
+            if member_path != *only {
+                continue;
+            }
+            matched_only = true;
+        }
+
+        let Some(stripped) = strip_path_components(&member_path, opts.strip_components) else {
+            // Entire path stripped — skip this member.
             members.push(UnpackMemberStats {
                 path: member_path,
                 original_bytes: original_len,
@@ -1009,6 +1189,25 @@ pub fn unpack_archive(
             });
             skipped += 1;
             continue;
+        };
+
+        let dest = safe_join(output_dir, &stripped)?;
+        if dest.exists() {
+            if opts.skip_existing {
+                members.push(UnpackMemberStats {
+                    path: member_path,
+                    original_bytes: original_len,
+                    skipped: true,
+                });
+                skipped += 1;
+                continue;
+            }
+            if !opts.force {
+                bail!(
+                    "output already exists: {} (use --force to overwrite or --skip-existing)",
+                    dest.display()
+                );
+            }
         }
 
         let plain = zstd_decompress_raw(&compressed)
@@ -1041,12 +1240,219 @@ pub fn unpack_archive(
         written += 1;
     }
 
+    if let Some(only) = &opts.only {
+        if !matched_only {
+            bail!("member not found in archive: {only}");
+        }
+    }
+
     Ok(UnpackStats {
         members,
         written,
         skipped,
         output_dir: output_dir.to_path_buf(),
     })
+}
+
+/// Decompress a single pack member (or whole single-file archive) to `writer`.
+///
+/// For v3 packs, `member` must be the archive-relative path. For v1/v2
+/// single-file archives, `member` is ignored.
+pub fn cat_member(archive: &Path, member: Option<&str>, mut writer: impl Write) -> Result<u64> {
+    let version = peek_version(archive)?;
+    if version == VERSION_V3 {
+        let member = member.ok_or_else(|| anyhow::anyhow!("member path is required for pack archives"))?;
+        let data = extract_pack_member(archive, member)?;
+        writer
+            .write_all(&data)
+            .context("writing member data to output")?;
+        writer.flush().context("flushing output")?;
+        return Ok(data.len() as u64);
+    }
+
+    let file = File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
+    let written = decompress_reader(BufReader::new(file), writer, None)?;
+    Ok(written)
+}
+
+/// Extract and verify one pack member into memory.
+pub fn extract_pack_member(archive: &Path, member_path: &str) -> Result<Vec<u8>> {
+    let file = File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
+    let mut reader = BufReader::new(file);
+
+    let mut magic = [0_u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        bail!("invalid file magic; this is not an rzc .rzst file");
+    }
+    let mut version = [0_u8; 1];
+    reader.read_exact(&mut version)?;
+    if version[0] != VERSION_V3 {
+        bail!("expected pack archive version {VERSION_V3}, got {}", version[0]);
+    }
+    let mut level_buf = [0_u8; 4];
+    reader.read_exact(&mut level_buf)?;
+    let mut count_buf = [0_u8; 4];
+    reader.read_exact(&mut count_buf)?;
+    let file_count = u32::from_le_bytes(count_buf);
+
+    for _ in 0..file_count {
+        let mut path_len_buf = [0_u8; 4];
+        reader.read_exact(&mut path_len_buf)?;
+        let path_len = u32::from_le_bytes(path_len_buf) as usize;
+        let mut path_bytes = vec![0_u8; path_len];
+        reader.read_exact(&mut path_bytes)?;
+        let path = String::from_utf8(path_bytes).context("pack member path is not UTF-8")?;
+
+        let mut original_len_buf = [0_u8; 8];
+        reader.read_exact(&mut original_len_buf)?;
+        let original_len = u64::from_le_bytes(original_len_buf);
+
+        let mut checksum = [0_u8; HASH_LEN];
+        reader.read_exact(&mut checksum)?;
+
+        let mut compressed_len_buf = [0_u8; 8];
+        reader.read_exact(&mut compressed_len_buf)?;
+        let compressed_len = u64::from_le_bytes(compressed_len_buf);
+
+        let mut compressed = vec![0_u8; compressed_len as usize];
+        reader
+            .read_exact(&mut compressed)
+            .with_context(|| format!("reading compressed data for {path}"))?;
+
+        if path != member_path {
+            continue;
+        }
+
+        let plain = zstd_decompress_raw(&compressed)
+            .with_context(|| format!("decompressing {path}"))?;
+        if plain.len() as u64 != original_len {
+            bail!(
+                "size mismatch for {path}: expected {original_len}, got {}",
+                plain.len()
+            );
+        }
+        let actual = sha256(&plain);
+        if actual != checksum {
+            bail!(
+                "checksum mismatch for {path}: expected {}, got {}",
+                hex::encode(checksum),
+                hex::encode(actual)
+            );
+        }
+        return Ok(plain);
+    }
+
+    bail!("member not found in archive: {member_path}");
+}
+
+/// Compare two archives by member path and checksum (v3) or single-file hash.
+pub fn diff_archives(a: &Path, b: &Path) -> Result<DiffResult> {
+    let map_a = archive_checksum_map(a)?;
+    let map_b = archive_checksum_map(b)?;
+
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    paths.extend(map_a.keys().cloned());
+    paths.extend(map_b.keys().cloned());
+
+    let mut entries = Vec::new();
+    let mut only_in_a = 0_u32;
+    let mut only_in_b = 0_u32;
+    let mut changed = 0_u32;
+    let mut identical = 0_u32;
+
+    for path in paths {
+        let ca = map_a.get(&path);
+        let cb = map_b.get(&path);
+        let (status, checksum_a, checksum_b) = match (ca, cb) {
+            (Some(ha), Some(hb)) if ha == hb => {
+                identical += 1;
+                (
+                    DiffStatus::Identical,
+                    Some(hex::encode(ha)),
+                    Some(hex::encode(hb)),
+                )
+            }
+            (Some(ha), Some(hb)) => {
+                changed += 1;
+                (
+                    DiffStatus::Changed,
+                    Some(hex::encode(ha)),
+                    Some(hex::encode(hb)),
+                )
+            }
+            (Some(ha), None) => {
+                only_in_a += 1;
+                (DiffStatus::OnlyInA, Some(hex::encode(ha)), None)
+            }
+            (None, Some(hb)) => {
+                only_in_b += 1;
+                (DiffStatus::OnlyInB, None, Some(hex::encode(hb)))
+            }
+            (None, None) => unreachable!(),
+        };
+        entries.push(DiffEntry {
+            path,
+            status,
+            checksum_a,
+            checksum_b,
+        });
+    }
+
+    Ok(DiffResult {
+        archive_a: a.to_path_buf(),
+        archive_b: b.to_path_buf(),
+        entries,
+        only_in_a,
+        only_in_b,
+        changed,
+        identical,
+    })
+}
+
+/// Build a path → checksum map for single-file or pack archives.
+fn archive_checksum_map(path: &Path) -> Result<BTreeMap<String, [u8; HASH_LEN]>> {
+    let version = peek_version(path)?;
+    if version == VERSION_V3 {
+        let info = inspect_pack(path)?;
+        let mut map = BTreeMap::new();
+        for m in info.members {
+            map.insert(m.path, m.checksum);
+        }
+        return Ok(map);
+    }
+
+    let info = inspect_file(path)?;
+    let checksum = match info.header.checksum {
+        Some(c) => c,
+        None => {
+            // v1: decompress and hash.
+            let mut out = Vec::new();
+            let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+            decompress_reader(BufReader::new(file), &mut out, None)?;
+            sha256(&out)
+        }
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<single>".into());
+    let mut map = BTreeMap::new();
+    map.insert(name, checksum);
+    Ok(map)
+}
+
+/// Strip the first `n` components from an archive path. Returns `None` if the
+/// path becomes empty (entirely stripped).
+pub fn strip_path_components(path: &str, n: u32) -> Option<String> {
+    if n == 0 {
+        return Some(path.to_string());
+    }
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if (n as usize) >= parts.len() {
+        return None;
+    }
+    Some(parts[n as usize..].join("/"))
 }
 
 /// Normalize a relative path for storage in the archive (forward slashes, no `..`).
@@ -1897,6 +2303,303 @@ mod tests {
         let mut vec = Vec::new();
         compress_bytes(&data, &mut vec, 3, 1, None)?;
         assert_eq!(sink.bytes, vec.len() as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn unpack_only_member() -> Result<()> {
+        let temp = tempdir()?;
+        let src = temp.path().join("src");
+        fs::create_dir_all(src.join("sub"))?;
+        fs::write(src.join("a.txt"), b"aaa")?;
+        fs::write(src.join("sub/b.txt"), b"bbb")?;
+        let archive = temp.path().join("a.rzst");
+        pack_directory(&src, &archive, 3, 1, &[])?;
+
+        let out = temp.path().join("out");
+        let stats = unpack_archive_opts(
+            &archive,
+            &out,
+            &UnpackOpts {
+                skip_existing: false,
+                only: Some("sub/b.txt".into()),
+                strip_components: 0,
+                force: true,
+            },
+        )?;
+        assert_eq!(stats.written, 1);
+        assert!(!out.join("a.txt").exists());
+        assert_eq!(fs::read(out.join("sub/b.txt"))?, b"bbb");
+
+        let missing = unpack_archive_opts(
+            &archive,
+            &temp.path().join("out2"),
+            &UnpackOpts {
+                only: Some("nope.txt".into()),
+                force: true,
+                ..Default::default()
+            },
+        );
+        assert!(missing.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unpack_strip_components() -> Result<()> {
+        let temp = tempdir()?;
+        let src = temp.path().join("src");
+        fs::create_dir_all(src.join("top/nested"))?;
+        fs::write(src.join("top/nested/file.txt"), b"payload")?;
+        let archive = temp.path().join("a.rzst");
+        pack_directory(&src, &archive, 3, 1, &[])?;
+
+        let out = temp.path().join("out");
+        let stats = unpack_archive_opts(
+            &archive,
+            &out,
+            &UnpackOpts {
+                strip_components: 1,
+                force: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(stats.written, 1);
+        assert_eq!(fs::read(out.join("nested/file.txt"))?, b"payload");
+        assert!(!out.join("top").exists());
+
+        let out2 = temp.path().join("out2");
+        let stats = unpack_archive_opts(
+            &archive,
+            &out2,
+            &UnpackOpts {
+                strip_components: 2,
+                force: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(stats.written, 1);
+        assert_eq!(fs::read(out2.join("file.txt"))?, b"payload");
+        Ok(())
+    }
+
+    #[test]
+    fn strip_path_components_helper() {
+        assert_eq!(
+            strip_path_components("a/b/c.txt", 0).as_deref(),
+            Some("a/b/c.txt")
+        );
+        assert_eq!(
+            strip_path_components("a/b/c.txt", 1).as_deref(),
+            Some("b/c.txt")
+        );
+        assert_eq!(
+            strip_path_components("a/b/c.txt", 2).as_deref(),
+            Some("c.txt")
+        );
+        assert_eq!(strip_path_components("a/b/c.txt", 3), None);
+        assert_eq!(strip_path_components("file.txt", 1), None);
+    }
+
+    #[test]
+    fn cat_member_from_pack() -> Result<()> {
+        let temp = tempdir()?;
+        let src = temp.path().join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(src.join("hello.txt"), b"hello cat world")?;
+        fs::write(src.join("other.txt"), b"other")?;
+        let archive = temp.path().join("a.rzst");
+        pack_directory(&src, &archive, 3, 1, &[])?;
+
+        let mut out = Vec::new();
+        let n = cat_member(&archive, Some("hello.txt"), &mut out)?;
+        assert_eq!(n, b"hello cat world".len() as u64);
+        assert_eq!(out, b"hello cat world");
+
+        assert!(cat_member(&archive, Some("missing"), &mut Vec::new()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cat_single_file_archive() -> Result<()> {
+        let temp = tempdir()?;
+        let input = temp.path().join("x.txt");
+        let compressed = temp.path().join("x.txt.rzst");
+        fs::write(&input, b"single cat")?;
+        compress_file(&input, &compressed, 3, 1, None)?;
+
+        let mut out = Vec::new();
+        let n = cat_member(&compressed, None, &mut out)?;
+        assert_eq!(n, 10);
+        assert_eq!(out, b"single cat");
+        Ok(())
+    }
+
+    #[test]
+    fn diff_pack_archives() -> Result<()> {
+        let temp = tempdir()?;
+        let a_dir = temp.path().join("a");
+        let b_dir = temp.path().join("b");
+        fs::create_dir_all(&a_dir)?;
+        fs::create_dir_all(&b_dir)?;
+        fs::write(a_dir.join("same.txt"), b"same")?;
+        fs::write(b_dir.join("same.txt"), b"same")?;
+        fs::write(a_dir.join("only_a.txt"), b"a")?;
+        fs::write(b_dir.join("only_b.txt"), b"b")?;
+        fs::write(a_dir.join("changed.txt"), b"v1")?;
+        fs::write(b_dir.join("changed.txt"), b"v2")?;
+
+        let a = temp.path().join("a.rzst");
+        let b = temp.path().join("b.rzst");
+        pack_directory(&a_dir, &a, 3, 1, &[])?;
+        pack_directory(&b_dir, &b, 3, 1, &[])?;
+
+        let diff = diff_archives(&a, &b)?;
+        assert_eq!(diff.identical, 1);
+        assert_eq!(diff.only_in_a, 1);
+        assert_eq!(diff.only_in_b, 1);
+        assert_eq!(diff.changed, 1);
+        assert!(!diff.is_equal());
+
+        let same = diff_archives(&a, &a)?;
+        assert!(same.is_equal());
+        assert_eq!(same.identical, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn diff_single_file_archives() -> Result<()> {
+        let temp = tempdir()?;
+        let f1 = temp.path().join("one.txt");
+        let f2 = temp.path().join("two.txt");
+        fs::write(&f1, b"content A")?;
+        fs::write(&f2, b"content B")?;
+        let a = temp.path().join("one.txt.rzst");
+        let b = temp.path().join("two.txt.rzst");
+        compress_file(&f1, &a, 3, 1, None)?;
+        compress_file(&f2, &b, 3, 1, None)?;
+
+        let diff = diff_archives(&a, &b)?;
+        // Different filenames → only_in_a + only_in_b (no shared path)
+        assert_eq!(diff.only_in_a + diff.only_in_b + diff.changed, 2);
+        assert!(!diff.is_equal());
+        Ok(())
+    }
+
+    #[test]
+    fn force_refuses_overwrite() -> Result<()> {
+        let temp = tempdir()?;
+        let input = temp.path().join("in.txt");
+        let out = temp.path().join("out.rzst");
+        fs::write(&input, b"data")?;
+        compress_file_opts(&input, &out, 3, 1, true, None)?;
+        let err = compress_file_opts(&input, &out, 3, 1, false, None)
+            .expect_err("should refuse overwrite");
+        assert!(err.to_string().contains("--force"));
+        compress_file_opts(&input, &out, 3, 1, true, None)?;
+
+        let dir = temp.path().join("d");
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("f"), b"x")?;
+        let pack_out = temp.path().join("p.rzst");
+        pack_directory_opts(
+            &dir,
+            &pack_out,
+            3,
+            1,
+            &PackOpts {
+                force: true,
+                ..Default::default()
+            },
+            None,
+        )?;
+        let err = pack_directory_opts(
+            &dir,
+            &pack_out,
+            3,
+            1,
+            &PackOpts {
+                force: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect_err("pack should refuse overwrite");
+        assert!(err.to_string().contains("--force"));
+        Ok(())
+    }
+
+    #[test]
+    fn pack_newer_than_days() -> Result<()> {
+        let temp = tempdir()?;
+        let src = temp.path().join("src");
+        fs::create_dir_all(&src)?;
+        let recent = src.join("recent.txt");
+        let old = src.join("old.txt");
+        fs::write(&recent, b"new")?;
+        fs::write(&old, b"old")?;
+
+        // Age `old` to ~10 days ago.
+        let ten_days = filetime::FileTime::from_system_time(
+            SystemTime::now() - Duration::from_secs(10 * 24 * 60 * 60),
+        );
+        filetime::set_file_mtime(&old, ten_days)?;
+
+        let archive = temp.path().join("a.rzst");
+        let stats = pack_directory_opts(
+            &src,
+            &archive,
+            3,
+            1,
+            &PackOpts {
+                newer_than_days: Some(3),
+                force: true,
+                ..Default::default()
+            },
+            None,
+        )?;
+        assert_eq!(stats.file_count, 1);
+        let info = inspect_pack(&archive)?;
+        assert_eq!(info.members.len(), 1);
+        assert_eq!(info.members[0].path, "recent.txt");
+        Ok(())
+    }
+
+    #[test]
+    fn unpack_force_required_when_exists() -> Result<()> {
+        let temp = tempdir()?;
+        let src = temp.path().join("s");
+        fs::create_dir_all(&src)?;
+        fs::write(src.join("f.txt"), b"packed")?;
+        let archive = temp.path().join("a.rzst");
+        pack_directory(&src, &archive, 3, 1, &[])?;
+
+        let out = temp.path().join("o");
+        fs::create_dir_all(&out)?;
+        fs::write(out.join("f.txt"), b"keep")?;
+
+        let err = unpack_archive_opts(
+            &archive,
+            &out,
+            &UnpackOpts {
+                force: false,
+                skip_existing: false,
+                ..Default::default()
+            },
+        )
+        .expect_err("should require force");
+        assert!(err.to_string().contains("--force") || err.to_string().contains("already exists"));
+        assert_eq!(fs::read(out.join("f.txt"))?, b"keep");
+
+        let stats = unpack_archive_opts(
+            &archive,
+            &out,
+            &UnpackOpts {
+                force: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(stats.written, 1);
+        assert_eq!(fs::read(out.join("f.txt"))?, b"packed");
         Ok(())
     }
 }
