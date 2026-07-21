@@ -2,7 +2,7 @@
 
 `rzc` is a fast Rust command-line compressor. It stores data in a compact `.rzst` container and uses [zstd](https://facebook.github.io/zstd/) to beat classic `zip -9` on both speed and compression ratio for text-heavy inputs.
 
-**Version:** 0.4.0
+**Version:** 0.5.0
 
 ## Features
 
@@ -36,6 +36,16 @@ Or run from the repo:
 
 ```sh
 cargo run --release -- --help
+```
+
+
+### Tree, grep, seal, repack (0.5)
+
+```sh
+rzc tree bundle.rzst
+rzc grep "TODO" bundle.rzst --max-size 1048576
+rzc seal archive.rzst && rzc check archive.rzst
+rzc repack in.rzst -o out.rzst --exclude "*.tmp" --force
 ```
 
 ## Usage
