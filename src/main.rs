@@ -11,13 +11,14 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use indicatif::{ProgressBar, ProgressStyle};
 use rust_file_compressor::{
-    append_suffix, bytes_per_second, cat_member, compress_bytes, compress_dir_recursive_ex,
-    compress_file_dry_run, compress_file_opts, compress_to_path, decompress_dir_recursive_ex,
-    decompress_file_opts, decompress_reader, decompress_to_path, default_decompressed_path,
-    diff_archives, display_bytes, doctor, inspect_file, is_stdio_path, list_archive,
-    pack_directory_opts, ratio_percent, resolve_threads, unpack_archive_opts, verify_file,
-    ArchiveInfo, DiffResult, DiffStatus, IoStats, ListResult, PackInfo, PackOpts, Preset,
-    UnpackOpts, DEFAULT_LEVEL,
+    append_suffix, archive_tree, bytes_per_second, cat_member, check_seal, compress_bytes,
+    compress_dir_recursive_ex, compress_file_dry_run, compress_file_opts, compress_to_path,
+    decompress_dir_recursive_ex, decompress_file_opts, decompress_reader, decompress_to_path,
+    default_decompressed_path, diff_archives, display_bytes, doctor, grep_archive,
+    inspect_file, is_stdio_path, list_archive, pack_directory_opts, ratio_percent, repack_archive,
+    resolve_threads, seal_archive, unpack_archive_opts, verify_file, ArchiveInfo, DiffResult,
+    DiffStatus, IoStats, ListResult, PackInfo, PackOpts, Preset, UnpackOpts, DEFAULT_GREP_MAX_SIZE,
+    DEFAULT_LEVEL,
 };
 use serde::Serialize;
 
@@ -29,6 +30,10 @@ use serde::Serialize;
     about = "Fast Rust file compression with pack archives, integrity checks, and zip benchmarks"
 )]
 struct Cli {
+    /// Less chatty output (suppress progress bars and non-essential messages).
+    #[arg(short = 'q', long, global = true)]
+    quiet: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -245,6 +250,71 @@ enum Commands {
         shell: Shell,
     },
 
+    /// Print pack member paths as a directory tree (v3 packs).
+    Tree {
+        /// Pack archive (.rzst v3).
+        archive: PathBuf,
+    },
+
+    /// Search decompressed text of archive members for a regex/substring.
+    Grep {
+        /// Regex pattern (Rust regex syntax; plain text works as a substring).
+        pattern: String,
+
+        /// .rzst archive (single-file or pack).
+        archive: PathBuf,
+
+        /// Skip members larger than this many bytes when decompressed (default: 32 MiB).
+        #[arg(long = "max-size", default_value_t = DEFAULT_GREP_MAX_SIZE)]
+        max_size: u64,
+
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Write a SHA-256 integrity sidecar (`file.rzst.sha256`).
+    Seal {
+        /// .rzst file to seal.
+        archive: PathBuf,
+
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Verify an archive against its `.sha256` seal sidecar.
+    Check {
+        /// .rzst file to check.
+        archive: PathBuf,
+
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Rewrite a pack archive, dropping members that match exclude globs.
+    Repack {
+        /// Input pack archive (.rzst v3).
+        input: PathBuf,
+
+        /// Output pack path.
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Glob patterns of members to drop (repeatable).
+        #[arg(long = "exclude", value_name = "GLOB")]
+        excludes: Vec<String>,
+
+        /// Overwrite existing output archive.
+        #[arg(long)]
+        force: bool,
+
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Compare this compressor against zip -9 on one input file.
     Bench {
         /// Text file to benchmark.
@@ -291,6 +361,7 @@ struct BenchJson {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let quiet = cli.quiet;
 
     match cli.command {
         Commands::Compress {
@@ -315,6 +386,7 @@ fn main() -> Result<()> {
                 dry_run,
                 &excludes,
                 force,
+                quiet,
             )?;
         }
         Commands::Decompress {
@@ -330,6 +402,7 @@ fn main() -> Result<()> {
                 recursive,
                 skip_existing,
                 force,
+                quiet,
             )?;
         }
         Commands::Pack {
@@ -354,6 +427,7 @@ fn main() -> Result<()> {
                 newer_than,
                 force,
                 json,
+                quiet,
             )?;
         }
         Commands::Unpack {
@@ -373,18 +447,19 @@ fn main() -> Result<()> {
                 strip_components,
                 force,
                 json,
+                quiet,
             )?;
         }
         Commands::Cat { archive, member } => {
-            run_cat(&archive, member.as_deref())?;
+            run_cat(&archive, member.as_deref(), quiet)?;
         }
         Commands::Diff {
             archive_a,
             archive_b,
             json,
-            quiet,
+            quiet: diff_quiet,
         } => {
-            run_diff(&archive_a, &archive_b, json, quiet)?;
+            run_diff(&archive_a, &archive_b, json, diff_quiet || quiet)?;
         }
         Commands::List { input, json } => {
             run_list(&input, json)?;
@@ -393,13 +468,39 @@ fn main() -> Result<()> {
             run_info(&input, json)?;
         }
         Commands::Verify { input } => {
-            run_verify(&input)?;
+            run_verify(&input, quiet)?;
         }
         Commands::Doctor { json } => {
             run_doctor(json)?;
         }
         Commands::Completions { shell } => {
             run_completions(shell)?;
+        }
+        Commands::Tree { archive } => {
+            run_tree(&archive)?;
+        }
+        Commands::Grep {
+            pattern,
+            archive,
+            max_size,
+            json,
+        } => {
+            run_grep(&pattern, &archive, max_size, json)?;
+        }
+        Commands::Seal { archive, json } => {
+            run_seal(&archive, json, quiet)?;
+        }
+        Commands::Check { archive, json } => {
+            run_check(&archive, json, quiet)?;
+        }
+        Commands::Repack {
+            input,
+            output,
+            excludes,
+            force,
+            json,
+        } => {
+            run_repack(&input, &output, &excludes, force, json, quiet)?;
         }
         Commands::Bench {
             input,
@@ -413,6 +514,7 @@ fn main() -> Result<()> {
             resolve_threads(threads),
             keep_artifacts,
             json,
+            quiet,
         )?,
     }
 
@@ -439,7 +541,9 @@ fn run_compress(
     dry_run: bool,
     excludes: &[String],
     force: bool,
+    quiet: bool,
 ) -> Result<()> {
+    let _ = quiet;
     if recursive {
         if is_stdio_path(input) {
             bail!("--recursive cannot be used with stdin (-)");
@@ -637,8 +741,9 @@ fn run_decompress(
     recursive: bool,
     skip_existing: bool,
     force: bool,
+    quiet: bool,
 ) -> Result<()> {
-    let _ = force; // decompress always overwrites unless --skip-existing
+    let _ = (force, quiet); // decompress overwrites unless --skip-existing
     if recursive {
         if is_stdio_path(input) {
             bail!("--recursive cannot be used with stdin (-)");
@@ -758,7 +863,9 @@ fn run_pack(
     newer_than: Option<u64>,
     force: bool,
     json: bool,
+    quiet: bool,
 ) -> Result<()> {
+    let _ = quiet;
     if !input.is_dir() {
         bail!("pack requires a directory; got {}", input.display());
     }
@@ -839,7 +946,9 @@ fn run_unpack(
     strip_components: u32,
     force: bool,
     json: bool,
+    quiet: bool,
 ) -> Result<()> {
+    let _ = quiet;
     let output_dir = output.map(Path::to_path_buf).unwrap_or_else(|| {
         let text = input.to_string_lossy();
         if let Some(stripped) = text.strip_suffix(".rzst") {
@@ -876,12 +985,12 @@ fn run_unpack(
     Ok(())
 }
 
-fn run_cat(archive: &Path, member: Option<&str>) -> Result<()> {
+fn run_cat(archive: &Path, member: Option<&str>, quiet: bool) -> Result<()> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     let written = cat_member(archive, member, &mut handle)?;
     // Only log to stderr so stdout stays clean for piping.
-    if io::stderr().is_terminal() {
+    if !quiet && io::stderr().is_terminal() {
         eprintln!("Wrote {} to stdout", display_bytes(written));
     }
     Ok(())
@@ -1047,7 +1156,8 @@ fn truncate_display(s: &str, max: usize) -> String {
     }
 }
 
-fn run_verify(input: &Path) -> Result<()> {
+fn run_verify(input: &Path, quiet: bool) -> Result<()> {
+    let _ = quiet;
     let result = list_archive(input).ok();
     let total = match &result {
         Some(ListResult::Single(i)) => i.header.original_len,
@@ -1112,6 +1222,93 @@ fn run_doctor(json: bool) -> Result<()> {
     }
     if !report.ok {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_tree(archive: &Path) -> Result<()> {
+    let tree = archive_tree(archive)?;
+    print!("{tree}");
+    if !tree.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+fn run_grep(pattern: &str, archive: &Path, max_size: u64, json: bool) -> Result<()> {
+    let result = grep_archive(archive, pattern, max_size)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if result.matches.is_empty() {
+        println!(
+            "No matches for {pattern:?} in {} (scanned {}, skipped {})",
+            archive.display(),
+            result.members_searched,
+            result.members_skipped
+        );
+    } else {
+        for m in &result.matches {
+            println!("{}:{}:{}", m.member, m.line_number, m.line);
+        }
+        eprintln!(
+            "({} match(es); scanned {}, skipped large/binary {})",
+            result.matches.len(),
+            result.members_searched,
+            result.members_skipped
+        );
+    }
+    Ok(())
+}
+
+fn run_seal(archive: &Path, json: bool, quiet: bool) -> Result<()> {
+    let info = seal_archive(archive)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&info)?);
+    } else if !quiet {
+        println!(
+            "Sealed {} → {} ({})",
+            info.archive.display(),
+            info.sidecar.display(),
+            &info.sha256[..16]
+        );
+    }
+    Ok(())
+}
+
+fn run_check(archive: &Path, json: bool, quiet: bool) -> Result<()> {
+    let info = check_seal(archive)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&info)?);
+    } else if !quiet {
+        println!(
+            "OK {} matches seal {} ({})",
+            info.archive.display(),
+            info.sidecar.display(),
+            &info.sha256[..16]
+        );
+    }
+    Ok(())
+}
+
+fn run_repack(
+    input: &Path,
+    output: &Path,
+    excludes: &[String],
+    force: bool,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    let stats = repack_archive(input, output, excludes, force)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+    } else if !quiet {
+        println!(
+            "Repacked {} → {} (kept {}, excluded {})",
+            input.display(),
+            output.display(),
+            stats.kept,
+            stats.excluded
+        );
     }
     Ok(())
 }
@@ -1190,7 +1387,9 @@ fn run_benchmark(
     threads: u32,
     keep_artifacts: bool,
     json: bool,
+    quiet: bool,
 ) -> Result<()> {
+    let _ = quiet;
     ensure_zip_available()?;
 
     let input_bytes = fs::metadata(input)

@@ -14,6 +14,8 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use rayon::prelude::*;
+use regex::Regex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -35,6 +37,9 @@ pub const HASH_LEN: usize = 32;
 
 /// Default zstd level for the balanced preset / CLI default.
 pub const DEFAULT_LEVEL: i32 = 12;
+
+/// Default max decompressed member size for `grep` (32 MiB).
+pub const DEFAULT_GREP_MAX_SIZE: u64 = 32 * 1024 * 1024;
 
 /// Compression quality presets mapped to zstd levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +298,46 @@ pub struct DoctorReport {
     pub container_v2_roundtrip: bool,
     pub pack_v3_roundtrip: bool,
     pub messages: Vec<String>,
+}
+
+/// One match from grepping archive member contents.
+#[derive(Debug, Clone, Serialize)]
+pub struct GrepMatch {
+    pub member: String,
+    pub line_number: usize,
+    pub line: String,
+}
+
+/// Result of grepping an archive.
+#[derive(Debug, Clone, Serialize)]
+pub struct GrepResult {
+    pub pattern: String,
+    pub matches: Vec<GrepMatch>,
+    pub members_searched: u32,
+    pub members_skipped: u32,
+    pub match_count: u32,
+}
+
+/// Result of writing or verifying a SHA-256 integrity sidecar.
+#[derive(Debug, Clone, Serialize)]
+pub struct SealInfo {
+    #[serde(serialize_with = "serialize_path")]
+    pub archive: PathBuf,
+    #[serde(serialize_with = "serialize_path")]
+    pub sidecar: PathBuf,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+/// Result of repacking a pack archive with member filters.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepackStats {
+    pub kept: u32,
+    pub excluded: u32,
+    pub original_bytes: u64,
+    pub archive_bytes: u64,
+    #[serde(serialize_with = "serialize_path")]
+    pub output_path: PathBuf,
 }
 
 /// Optional progress callback: `(bytes_processed, total_hint)`.
@@ -1047,6 +1092,23 @@ pub fn pack_directory_opts(
         cb(0, total_files);
     }
 
+    // Compress independent members in parallel (rayon); write in original order.
+    // Progress is reported when compression finishes (callback is not Sync).
+    let packed: Vec<(String, u64, [u8; HASH_LEN], Vec<u8>)> = files
+        .par_iter()
+        .map(|(rel_path, abs_path)| -> Result<(String, u64, [u8; HASH_LEN], Vec<u8>)> {
+            let data =
+                fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
+            let checksum = sha256(&data);
+            let compressed = zstd_compress_raw(&data, level, threads)?;
+            Ok((rel_path.clone(), data.len() as u64, checksum, compressed))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if let Some(cb) = progress {
+        cb(total_files, total_files);
+    }
+
     ensure_parent_dir(output)?;
     let out_file =
         File::create(output).with_context(|| format!("creating {}", output.display()))?;
@@ -1055,13 +1117,10 @@ pub fn pack_directory_opts(
     writer.write_all(MAGIC)?;
     writer.write_all(&[VERSION_V3])?;
     writer.write_all(&level.to_le_bytes())?;
-    writer.write_all(&(files.len() as u32).to_le_bytes())?;
+    writer.write_all(&(packed.len() as u32).to_le_bytes())?;
 
     let mut original_bytes: u64 = 0;
-    for (idx, (rel_path, abs_path)) in files.iter().enumerate() {
-        let data = fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
-        let checksum = sha256(&data);
-        let compressed = zstd_compress_raw(&data, level, threads)?;
+    for (rel_path, original_len, checksum, compressed) in &packed {
         let path_bytes = rel_path.as_bytes();
         if path_bytes.len() > u32::MAX as usize {
             bail!("path too long: {rel_path}");
@@ -1069,15 +1128,12 @@ pub fn pack_directory_opts(
 
         writer.write_all(&(path_bytes.len() as u32).to_le_bytes())?;
         writer.write_all(path_bytes)?;
-        writer.write_all(&(data.len() as u64).to_le_bytes())?;
-        writer.write_all(&checksum)?;
+        writer.write_all(&original_len.to_le_bytes())?;
+        writer.write_all(checksum)?;
         writer.write_all(&(compressed.len() as u64).to_le_bytes())?;
-        writer.write_all(&compressed)?;
+        writer.write_all(compressed)?;
 
-        original_bytes += data.len() as u64;
-        if let Some(cb) = progress {
-            cb((idx as u64) + 1, total_files);
-        }
+        original_bytes += original_len;
     }
 
     writer.flush()?;
@@ -1088,7 +1144,7 @@ pub fn pack_directory_opts(
         .len();
 
     Ok(PackStats {
-        file_count: files.len() as u32,
+        file_count: packed.len() as u32,
         original_bytes,
         archive_bytes,
         output_path: output.to_path_buf(),
@@ -1801,6 +1857,363 @@ pub fn default_decompressed_path(path: &Path) -> PathBuf {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tree / grep / seal / repack
+// ---------------------------------------------------------------------------
+
+/// Build a tree string of member paths (for v3 packs; also works for a path list).
+pub fn format_path_tree(paths: &[String]) -> String {
+    #[derive(Default)]
+    struct Node {
+        children: BTreeMap<String, Node>,
+        is_file: bool,
+    }
+
+    let mut root = Node::default();
+    for path in paths {
+        let mut cur = &mut root;
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        for (i, part) in parts.iter().enumerate() {
+            let is_last = i + 1 == parts.len();
+            let child = cur.children.entry((*part).to_string()).or_default();
+            if is_last {
+                child.is_file = true;
+            }
+            cur = child;
+        }
+    }
+
+    fn render(node: &Node, prefix: &str, lines: &mut Vec<String>) {
+        let entries: Vec<_> = node.children.iter().collect();
+        for (i, (name, child)) in entries.iter().enumerate() {
+            let is_last = i + 1 == entries.len();
+            let branch = if is_last { "└── " } else { "├── " };
+            lines.push(format!("{prefix}{branch}{name}"));
+            let child_prefix = format!("{prefix}{}", if is_last { "    " } else { "│   " });
+            render(child, &child_prefix, lines);
+        }
+    }
+
+    let mut lines = Vec::new();
+    render(&root, "", &mut lines);
+    lines.join("\n")
+}
+
+/// Print member paths of a pack archive as a directory tree.
+pub fn archive_tree(path: &Path) -> Result<String> {
+    let version = peek_version(path)?;
+    if version != VERSION_V3 {
+        bail!("tree requires a v3 pack archive (got version {version})");
+    }
+    let info = inspect_pack(path)?;
+    let paths: Vec<String> = info.members.iter().map(|m| m.path.clone()).collect();
+    let mut out = format!("{}\n", path.display());
+    let tree = format_path_tree(&paths);
+    if !tree.is_empty() {
+        out.push_str(&tree);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Grep decompressed text of archive members (single-file or pack).
+///
+/// Members whose original size exceeds `max_size` are skipped.
+/// Pattern is a Rust regex (substring matches when used as a literal).
+pub fn grep_archive(path: &Path, pattern: &str, max_size: u64) -> Result<GrepResult> {
+    let re = Regex::new(pattern).with_context(|| format!("invalid regex pattern: {pattern}"))?;
+    let version = peek_version(path)?;
+
+    let mut matches = Vec::new();
+    let mut members_searched = 0_u32;
+    let mut members_skipped = 0_u32;
+
+    if version == VERSION_V3 {
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut reader = BufReader::new(file);
+
+        let mut magic = [0_u8; 4];
+        reader.read_exact(&mut magic)?;
+        if &magic != MAGIC {
+            bail!("invalid file magic");
+        }
+        let mut version_buf = [0_u8; 1];
+        reader.read_exact(&mut version_buf)?;
+        let mut level_buf = [0_u8; 4];
+        reader.read_exact(&mut level_buf)?;
+        let mut count_buf = [0_u8; 4];
+        reader.read_exact(&mut count_buf)?;
+        let file_count = u32::from_le_bytes(count_buf);
+
+        for _ in 0..file_count {
+            let mut path_len_buf = [0_u8; 4];
+            reader.read_exact(&mut path_len_buf)?;
+            let path_len = u32::from_le_bytes(path_len_buf) as usize;
+            let mut path_bytes = vec![0_u8; path_len];
+            reader.read_exact(&mut path_bytes)?;
+            let member_path =
+                String::from_utf8(path_bytes).context("pack member path is not UTF-8")?;
+
+            let mut original_len_buf = [0_u8; 8];
+            reader.read_exact(&mut original_len_buf)?;
+            let original_len = u64::from_le_bytes(original_len_buf);
+
+            let mut checksum = [0_u8; HASH_LEN];
+            reader.read_exact(&mut checksum)?;
+
+            let mut compressed_len_buf = [0_u8; 8];
+            reader.read_exact(&mut compressed_len_buf)?;
+            let compressed_len = u64::from_le_bytes(compressed_len_buf);
+
+            let mut compressed = vec![0_u8; compressed_len as usize];
+            reader.read_exact(&mut compressed)?;
+
+            if original_len > max_size {
+                members_skipped += 1;
+                continue;
+            }
+
+            let plain = zstd_decompress_raw(&compressed)?;
+            if plain.len() as u64 != original_len {
+                bail!(
+                    "size mismatch in member {member_path}: expected {original_len}, got {}",
+                    plain.len()
+                );
+            }
+            let actual = sha256(&plain);
+            if actual != checksum {
+                bail!("checksum mismatch for member {member_path}");
+            }
+
+            members_searched += 1;
+            grep_plain(&member_path, &plain, &re, &mut matches);
+        }
+    } else {
+        let info = inspect_file(path)?;
+        if info.header.original_len > max_size {
+            members_skipped = 1;
+        } else {
+            let mut plain = Vec::new();
+            let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+            decompress_reader(BufReader::new(file), &mut plain, None)?;
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "<single>".into());
+            members_searched = 1;
+            grep_plain(&name, &plain, &re, &mut matches);
+        }
+    }
+
+    let match_count = matches.len() as u32;
+    Ok(GrepResult {
+        pattern: pattern.to_string(),
+        matches,
+        members_searched,
+        members_skipped,
+        match_count,
+    })
+}
+
+fn grep_plain(member: &str, plain: &[u8], re: &Regex, matches: &mut Vec<GrepMatch>) {
+    // Lossy decode so binary members don't panic; still searchable as text.
+    let text = String::from_utf8_lossy(plain);
+    for (idx, line) in text.lines().enumerate() {
+        if re.is_match(line) {
+            matches.push(GrepMatch {
+                member: member.to_string(),
+                line_number: idx + 1,
+                line: line.to_string(),
+            });
+        }
+    }
+}
+
+/// Sidecar path for `seal` / `check`: `<archive>.sha256`.
+pub fn seal_sidecar_path(archive: &Path) -> PathBuf {
+    let mut s = archive.as_os_str().to_os_string();
+    s.push(".sha256");
+    PathBuf::from(s)
+}
+
+/// Hash an archive file and write a password-less integrity sidecar (`.rzst.sha256`).
+pub fn seal_archive(path: &Path) -> Result<SealInfo> {
+    let data = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let digest = sha256(&data);
+    let hex_digest = hex::encode(digest);
+    let sidecar = seal_sidecar_path(path);
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    // sha256sum-compatible: "<hex>  <filename>\n"
+    let contents = format!("{hex_digest}  {file_name}\n");
+    fs::write(&sidecar, contents.as_bytes())
+        .with_context(|| format!("writing sidecar {}", sidecar.display()))?;
+    Ok(SealInfo {
+        archive: path.to_path_buf(),
+        sidecar,
+        sha256: hex_digest,
+        bytes: data.len() as u64,
+    })
+}
+
+/// Verify an archive against its `.sha256` sidecar written by [`seal_archive`].
+pub fn check_seal(path: &Path) -> Result<SealInfo> {
+    let sidecar = seal_sidecar_path(path);
+    if !sidecar.exists() {
+        bail!(
+            "no seal sidecar found: {} (run `rzc seal` first)",
+            sidecar.display()
+        );
+    }
+    let text = fs::read_to_string(&sidecar)
+        .with_context(|| format!("reading sidecar {}", sidecar.display()))?;
+    let expected_hex = parse_sidecar_hash(&text)?;
+    let data = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let actual = hex::encode(sha256(&data));
+    if actual != expected_hex {
+        bail!(
+            "seal check failed for {}: expected {expected_hex}, got {actual}",
+            path.display()
+        );
+    }
+    Ok(SealInfo {
+        archive: path.to_path_buf(),
+        sidecar,
+        sha256: actual,
+        bytes: data.len() as u64,
+    })
+}
+
+fn parse_sidecar_hash(text: &str) -> Result<String> {
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .context("seal sidecar is empty")?;
+    let hex_part = line
+        .split_whitespace()
+        .next()
+        .context("seal sidecar has no hash")?;
+    if hex_part.len() != HASH_LEN * 2 || !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("seal sidecar hash is not a valid 64-char hex SHA-256");
+    }
+    Ok(hex_part.to_ascii_lowercase())
+}
+
+/// Rewrite a v3 pack archive, dropping members that match any exclude glob.
+///
+/// Compressed payloads are copied without re-compression. Format remains v3.
+pub fn repack_archive(
+    input: &Path,
+    output: &Path,
+    excludes: &[String],
+    force: bool,
+) -> Result<RepackStats> {
+    if output.exists() && !force {
+        bail!(
+            "output already exists: {} (use --force to overwrite)",
+            output.display()
+        );
+    }
+    if input == output {
+        bail!("repack input and output paths must differ");
+    }
+
+    let exclude_set = build_exclude_set(excludes)?;
+    let file = File::open(input).with_context(|| format!("opening {}", input.display()))?;
+    let mut reader = BufReader::new(file);
+
+    let mut magic = [0_u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        bail!("invalid file magic; this is not an rzc .rzst file");
+    }
+    let mut version = [0_u8; 1];
+    reader.read_exact(&mut version)?;
+    if version[0] != VERSION_V3 {
+        bail!("repack requires a v3 pack archive (got version {})", version[0]);
+    }
+    let mut level_buf = [0_u8; 4];
+    reader.read_exact(&mut level_buf)?;
+    let level = i32::from_le_bytes(level_buf);
+    let mut count_buf = [0_u8; 4];
+    reader.read_exact(&mut count_buf)?;
+    let file_count = u32::from_le_bytes(count_buf);
+
+    // Buffer kept members so we know the final count before writing the header.
+    let mut kept: Vec<(String, u64, [u8; HASH_LEN], Vec<u8>)> = Vec::new();
+    let mut excluded = 0_u32;
+    let mut original_bytes = 0_u64;
+
+    for _ in 0..file_count {
+        let mut path_len_buf = [0_u8; 4];
+        reader.read_exact(&mut path_len_buf)?;
+        let path_len = u32::from_le_bytes(path_len_buf) as usize;
+        let mut path_bytes = vec![0_u8; path_len];
+        reader.read_exact(&mut path_bytes)?;
+        let member_path = String::from_utf8(path_bytes).context("pack member path is not UTF-8")?;
+
+        let mut original_len_buf = [0_u8; 8];
+        reader.read_exact(&mut original_len_buf)?;
+        let original_len = u64::from_le_bytes(original_len_buf);
+
+        let mut checksum = [0_u8; HASH_LEN];
+        reader.read_exact(&mut checksum)?;
+
+        let mut compressed_len_buf = [0_u8; 8];
+        reader.read_exact(&mut compressed_len_buf)?;
+        let compressed_len = u64::from_le_bytes(compressed_len_buf);
+
+        let mut compressed = vec![0_u8; compressed_len as usize];
+        reader.read_exact(&mut compressed)?;
+
+        if is_excluded(&member_path, &exclude_set) {
+            excluded += 1;
+            continue;
+        }
+        original_bytes += original_len;
+        kept.push((member_path, original_len, checksum, compressed));
+    }
+
+    if kept.is_empty() {
+        bail!("repack would produce an empty archive (all members excluded)");
+    }
+
+    ensure_parent_dir(output)?;
+    let out_file =
+        File::create(output).with_context(|| format!("creating {}", output.display()))?;
+    let mut writer = BufWriter::new(out_file);
+    writer.write_all(MAGIC)?;
+    writer.write_all(&[VERSION_V3])?;
+    writer.write_all(&level.to_le_bytes())?;
+    writer.write_all(&(kept.len() as u32).to_le_bytes())?;
+
+    for (member_path, original_len, checksum, compressed) in &kept {
+        let path_bytes = member_path.as_bytes();
+        writer.write_all(&(path_bytes.len() as u32).to_le_bytes())?;
+        writer.write_all(path_bytes)?;
+        writer.write_all(&original_len.to_le_bytes())?;
+        writer.write_all(checksum)?;
+        writer.write_all(&(compressed.len() as u64).to_le_bytes())?;
+        writer.write_all(compressed)?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let archive_bytes = fs::metadata(output)
+        .with_context(|| format!("reading metadata for {}", output.display()))?
+        .len();
+
+    Ok(RepackStats {
+        kept: kept.len() as u32,
+        excluded,
+        original_bytes,
+        archive_bytes,
+        output_path: output.to_path_buf(),
+    })
+}
+
 /// Resolve worker thread count: `0` means available CPUs capped at 8.
 pub fn resolve_threads(requested: u32) -> u32 {
     if requested > 0 {
@@ -1810,6 +2223,29 @@ pub fn resolve_threads(requested: u32) -> u32 {
     std::thread::available_parallelism()
         .map(|count| count.get().min(8) as u32)
         .unwrap_or(1)
+}
+
+/// Format a duration in a human-readable form (`1.234s`, `2m 03s`, `1h 02m 03s`).
+pub fn format_duration(d: Duration) -> String {
+    let total_secs = d.as_secs_f64();
+    if total_secs < 60.0 {
+        if total_secs == 0.0 {
+            return "0s".to_string();
+        }
+        if total_secs < 0.001 {
+            return format!("{}µs", d.as_micros().max(1));
+        }
+        return format!("{total_secs:.3}s");
+    }
+    let total = d.as_secs();
+    let hours = total / 3600;
+    let mins = (total % 3600) / 60;
+    let secs = total % 60;
+    if hours > 0 {
+        format!("{hours}h {mins:02}m {secs:02}s")
+    } else {
+        format!("{mins}m {secs:02}s")
+    }
 }
 
 /// Human-readable byte size (binary units).
@@ -2601,5 +3037,139 @@ mod tests {
         assert_eq!(stats.written, 1);
         assert_eq!(fs::read(out.join("f.txt"))?, b"packed");
         Ok(())
+    }
+
+    #[test]
+    fn format_path_tree_nested() {
+        let paths = vec![
+            "README".into(),
+            "src/main.rs".into(),
+            "src/lib.rs".into(),
+            "docs/guide.md".into(),
+        ];
+        let tree = format_path_tree(&paths);
+        assert!(tree.contains("README"));
+        assert!(tree.contains("src"));
+        assert!(tree.contains("main.rs"));
+        assert!(tree.contains("lib.rs"));
+        assert!(tree.contains("docs"));
+        assert!(tree.contains("├──") || tree.contains("└──"));
+    }
+
+    #[test]
+    fn archive_tree_from_pack() -> Result<()> {
+        let temp = tempdir()?;
+        let src = temp.path().join("src");
+        fs::create_dir_all(src.join("sub"))?;
+        fs::write(src.join("a.txt"), b"a")?;
+        fs::write(src.join("sub/b.txt"), b"b")?;
+        let archive = temp.path().join("a.rzst");
+        pack_directory(&src, &archive, 3, 1, &[])?;
+        let tree = archive_tree(&archive)?;
+        assert!(tree.contains("a.txt"));
+        assert!(tree.contains("sub"));
+        assert!(tree.contains("b.txt"));
+        Ok(())
+    }
+
+    #[test]
+    fn grep_pack_members() -> Result<()> {
+        let temp = tempdir()?;
+        let src = temp.path().join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(src.join("notes.txt"), b"hello world\nfind me here\nbye\n")?;
+        fs::write(src.join("other.txt"), b"nothing interesting\n")?;
+        let archive = temp.path().join("a.rzst");
+        pack_directory(&src, &archive, 3, 1, &[])?;
+
+        let result = grep_archive(&archive, "find me", DEFAULT_GREP_MAX_SIZE)?;
+        assert_eq!(result.match_count, 1);
+        assert_eq!(result.matches[0].member, "notes.txt");
+        assert_eq!(result.matches[0].line_number, 2);
+        assert!(result.matches[0].line.contains("find me"));
+
+        let re = grep_archive(&archive, r"find\s+me", DEFAULT_GREP_MAX_SIZE)?;
+        assert_eq!(re.match_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn grep_skips_oversize_members() -> Result<()> {
+        let temp = tempdir()?;
+        let src = temp.path().join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(src.join("big.txt"), b"secret marker in big file")?;
+        let archive = temp.path().join("a.rzst");
+        pack_directory(&src, &archive, 3, 1, &[])?;
+
+        let result = grep_archive(&archive, "secret", 5)?;
+        assert_eq!(result.members_skipped, 1);
+        assert_eq!(result.members_searched, 0);
+        assert_eq!(result.match_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn seal_and_check_roundtrip() -> Result<()> {
+        let temp = tempdir()?;
+        let input = temp.path().join("x.txt");
+        let archive = temp.path().join("x.txt.rzst");
+        fs::write(&input, b"seal me")?;
+        compress_file(&input, &archive, 3, 1, None)?;
+
+        let sealed = seal_archive(&archive)?;
+        assert!(sealed.sidecar.exists());
+        assert_eq!(sealed.sidecar, seal_sidecar_path(&archive));
+
+        let checked = check_seal(&archive)?;
+        assert_eq!(checked.sha256, sealed.sha256);
+
+        // Tamper with archive
+        let mut bytes = fs::read(&archive)?;
+        if let Some(last) = bytes.last_mut() {
+            *last ^= 0xff;
+        }
+        fs::write(&archive, &bytes)?;
+        assert!(check_seal(&archive).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn repack_exclude_members() -> Result<()> {
+        let temp = tempdir()?;
+        let src = temp.path().join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(src.join("keep.txt"), b"keep")?;
+        fs::write(src.join("drop.tmp"), b"tmp")?;
+        fs::write(src.join("notes.log"), b"log")?;
+        let input = temp.path().join("in.rzst");
+        pack_directory(&src, &input, 3, 1, &[])?;
+        assert_eq!(inspect_pack(&input)?.file_count, 3);
+
+        let output = temp.path().join("out.rzst");
+        let stats = repack_archive(
+            &input,
+            &output,
+            &["*.tmp".into(), "*.log".into()],
+            true,
+        )?;
+        assert_eq!(stats.kept, 1);
+        assert_eq!(stats.excluded, 2);
+
+        let info = inspect_pack(&output)?;
+        assert_eq!(info.file_count, 1);
+        assert_eq!(info.members[0].path, "keep.txt");
+
+        let err = repack_archive(&input, &output, &["*.tmp".into()], false);
+        assert!(err.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn format_duration_human() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+        assert!(format_duration(Duration::from_millis(250)).contains('s'));
+        assert_eq!(format_duration(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(format_duration(Duration::from_secs(3661)), "1h 01m 01s");
     }
 }

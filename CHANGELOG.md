@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.0] — 2026-07-21
+
+### Added
+- **`rzc tree`** — directory tree of pack members (v3)
+- **`rzc grep`** — search decompressed text members (regex, size cap)
+- **`rzc seal` / `rzc check`** — SHA-256 integrity sidecar (`.rzst.sha256`)
+- **`rzc repack`** — rewrite packs with `--exclude` globs (no recompress)
+- **Global `-q` / `--quiet`** — quieter CLI
+- **`format_duration`** helper for human-readable timings
+- Expanded library tests for tree, grep, seal/check, repack
+
+### Changed
+- Version **0.5.0**
+- Single-file v2 and pack v3 remain fully compatible
+
+
 ## 0.4.0 — 2026-07-19
 
 ### Added
