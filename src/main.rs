@@ -14,8 +14,8 @@ use rust_file_compressor::{
     append_suffix, archive_tree, bytes_per_second, cat_member, check_seal, compress_bytes,
     compress_dir_recursive_ex, compress_file_dry_run, compress_file_opts, compress_to_path,
     decompress_dir_recursive_ex, decompress_file_opts, decompress_reader, decompress_to_path,
-    default_decompressed_path, diff_archives, display_bytes, doctor, grep_archive,
-    inspect_file, is_stdio_path, list_archive, pack_directory_opts, ratio_percent, repack_archive,
+    default_decompressed_path, diff_archives, display_bytes, doctor, grep_archive, inspect_file,
+    is_stdio_path, list_archive, pack_directory_opts, ratio_percent, repack_archive,
     resolve_threads, seal_archive, unpack_archive_opts, verify_file, ArchiveInfo, DiffResult,
     DiffStatus, IoStats, ListResult, PackInfo, PackOpts, Preset, UnpackOpts, DEFAULT_GREP_MAX_SIZE,
     DEFAULT_LEVEL,
@@ -439,16 +439,13 @@ fn main() -> Result<()> {
             force,
             json,
         } => {
-            run_unpack(
-                &input,
-                output.as_deref(),
+            let opts = UnpackOpts {
                 skip_existing,
-                only.as_deref(),
+                only,
                 strip_components,
                 force,
-                json,
-                quiet,
-            )?;
+            };
+            run_unpack(&input, output.as_deref(), &opts, json, quiet)?;
         }
         Commands::Cat { archive, member } => {
             run_cat(&archive, member.as_deref(), quiet)?;
@@ -886,11 +883,9 @@ fn run_pack(
     let pb = if !json && io::stderr().is_terminal() {
         let bar = ProgressBar::new(0);
         bar.set_style(
-            ProgressStyle::with_template(
-                "{msg} [{bar:40.cyan/blue}] {pos}/{len} files ({eta})",
-            )
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("=>-"),
+            ProgressStyle::with_template("{msg} [{bar:40.cyan/blue}] {pos}/{len} files ({eta})")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("=>-"),
         );
         bar.set_message("packing");
         Some(bar)
@@ -938,13 +933,13 @@ fn run_pack(
     Ok(())
 }
 
+// Without --force, unpacking refuses to overwrite existing member files (use
+// --skip-existing to leave them alone, or --force to replace); new files always
+// write fine. Those switches travel together in `opts`.
 fn run_unpack(
     input: &Path,
     output: Option<&Path>,
-    skip_existing: bool,
-    only: Option<&str>,
-    strip_components: u32,
-    force: bool,
+    opts: &UnpackOpts,
     json: bool,
     quiet: bool,
 ) -> Result<()> {
@@ -958,16 +953,7 @@ fn run_unpack(
         }
     });
 
-    // Without --force, refuse to overwrite existing member files (use --skip-existing
-    // to leave them alone, or --force to replace). New files always write fine.
-    let opts = UnpackOpts {
-        skip_existing,
-        only: only.map(|s| s.to_string()),
-        strip_components,
-        force,
-    };
-
-    let stats = unpack_archive_opts(input, &output_dir, &opts)?;
+    let stats = unpack_archive_opts(input, &output_dir, opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {
@@ -1017,24 +1003,26 @@ fn print_diff(result: &DiffResult) {
     );
     println!();
     if result.is_equal() {
-        println!(
-            "Archives are identical ({} member(s))",
-            result.identical
-        );
+        println!("Archives are identical ({} member(s))", result.identical);
         return;
     }
-    println!(
-        "{:<10} {:<40} detail",
-        "status", "path"
-    );
+    println!("{:<10} {:<40} detail", "status", "path");
     for e in &result.entries {
         match e.status {
             DiffStatus::Identical => continue,
             DiffStatus::OnlyInA => {
-                println!("{:<10} {:<40} only in A", "only_a", truncate_display(&e.path, 40));
+                println!(
+                    "{:<10} {:<40} only in A",
+                    "only_a",
+                    truncate_display(&e.path, 40)
+                );
             }
             DiffStatus::OnlyInB => {
-                println!("{:<10} {:<40} only in B", "only_b", truncate_display(&e.path, 40));
+                println!(
+                    "{:<10} {:<40} only in B",
+                    "only_b",
+                    truncate_display(&e.path, 40)
+                );
             }
             DiffStatus::Changed => {
                 println!(

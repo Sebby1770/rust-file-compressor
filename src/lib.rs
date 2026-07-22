@@ -534,6 +534,26 @@ fn zstd_compress_raw(data: &[u8], level: i32, threads: u32) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Read a blob whose length was declared by an archive header.
+///
+/// The buffer grows from what the archive actually contains instead of being
+/// pre-allocated at the declared size. A hostile header can claim any length,
+/// and `vec![0; declared]` would ask the allocator for it outright — a 69-byte
+/// crafted archive declaring 281 TB aborted the process before any validation
+/// ran. Reading through `take` bounds memory by the real remaining bytes, so a
+/// bogus length becomes an ordinary error.
+fn read_declared(reader: &mut impl Read, len: u64, what: &str) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let read = reader
+        .take(len)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("reading {what}"))?;
+    if read as u64 != len {
+        bail!("{what}: header declares {len} bytes but only {read} remain in the archive");
+    }
+    Ok(buf)
+}
+
 /// Decompress a raw zstd frame into memory.
 fn zstd_decompress_raw(data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder =
@@ -861,7 +881,7 @@ pub fn inspect_pack(path: &Path) -> Result<PackInfo> {
     reader.read_exact(&mut count_buf)?;
     let file_count = u32::from_le_bytes(count_buf);
 
-    let mut members = Vec::with_capacity(file_count as usize);
+    let mut members = Vec::with_capacity((file_count as usize).min(1024));
     for _ in 0..file_count {
         let mut path_len_buf = [0_u8; 4];
         reader.read_exact(&mut path_len_buf)?;
@@ -869,8 +889,7 @@ pub fn inspect_pack(path: &Path) -> Result<PackInfo> {
         if path_len > 16 * 1024 {
             bail!("pack member path too long ({path_len} bytes)");
         }
-        let mut path_bytes = vec![0_u8; path_len];
-        reader.read_exact(&mut path_bytes)?;
+        let path_bytes = read_declared(&mut reader, path_len as u64, "pack member path")?;
         let member_path = String::from_utf8(path_bytes).context("pack member path is not UTF-8")?;
 
         let mut original_len_buf = [0_u8; 8];
@@ -884,9 +903,17 @@ pub fn inspect_pack(path: &Path) -> Result<PackInfo> {
         reader.read_exact(&mut compressed_len_buf)?;
         let compressed_len = u64::from_le_bytes(compressed_len_buf);
 
-        // Skip compressed payload.
-        io::copy(&mut reader.by_ref().take(compressed_len), &mut io::sink())
+        // Skip compressed payload. `take` stops at EOF without complaining, so
+        // compare what was actually skipped: otherwise a member declaring more
+        // bytes than the archive holds is reported as valid metadata.
+        let skipped = io::copy(&mut reader.by_ref().take(compressed_len), &mut io::sink())
             .context("skipping compressed member payload")?;
+        if skipped != compressed_len {
+            bail!(
+                "pack member '{member_path}' declares {compressed_len} compressed bytes \
+                 but only {skipped} remain in the archive"
+            );
+        }
 
         members.push(PackMemberInfo {
             path: member_path,
@@ -945,8 +972,8 @@ pub fn verify_pack(path: &Path, progress: Option<&ProgressFn<'_>>) -> Result<u64
         let mut path_len_buf = [0_u8; 4];
         reader.read_exact(&mut path_len_buf)?;
         let path_len = u32::from_le_bytes(path_len_buf) as usize;
-        let mut path_bytes = vec![0_u8; path_len];
-        reader.read_exact(&mut path_bytes)?;
+        // This pass only totals sizes; the path itself is skipped over.
+        read_declared(&mut reader, path_len as u64, "pack member path")?;
 
         let mut original_len_buf = [0_u8; 8];
         reader.read_exact(&mut original_len_buf)?;
@@ -959,10 +986,11 @@ pub fn verify_pack(path: &Path, progress: Option<&ProgressFn<'_>>) -> Result<u64
         reader.read_exact(&mut compressed_len_buf)?;
         let compressed_len = u64::from_le_bytes(compressed_len_buf);
 
-        let mut compressed = vec![0_u8; compressed_len as usize];
-        reader
-            .read_exact(&mut compressed)
-            .with_context(|| format!("reading pack member {i} payload"))?;
+        let compressed = read_declared(
+            &mut reader,
+            compressed_len,
+            &format!("pack member {i} payload"),
+        )?;
 
         let plain = zstd_decompress_raw(&compressed)?;
         if plain.len() as u64 != original_len {
@@ -1096,13 +1124,15 @@ pub fn pack_directory_opts(
     // Progress is reported when compression finishes (callback is not Sync).
     let packed: Vec<(String, u64, [u8; HASH_LEN], Vec<u8>)> = files
         .par_iter()
-        .map(|(rel_path, abs_path)| -> Result<(String, u64, [u8; HASH_LEN], Vec<u8>)> {
-            let data =
-                fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
-            let checksum = sha256(&data);
-            let compressed = zstd_compress_raw(&data, level, threads)?;
-            Ok((rel_path.clone(), data.len() as u64, checksum, compressed))
-        })
+        .map(
+            |(rel_path, abs_path)| -> Result<(String, u64, [u8; HASH_LEN], Vec<u8>)> {
+                let data = fs::read(abs_path)
+                    .with_context(|| format!("reading {}", abs_path.display()))?;
+                let checksum = sha256(&data);
+                let compressed = zstd_compress_raw(&data, level, threads)?;
+                Ok((rel_path.clone(), data.len() as u64, checksum, compressed))
+            },
+        )
         .collect::<Result<Vec<_>>>()?;
 
     if let Some(cb) = progress {
@@ -1200,7 +1230,7 @@ pub fn unpack_archive_opts(
     fs::create_dir_all(output_dir)
         .with_context(|| format!("creating output directory {}", output_dir.display()))?;
 
-    let mut members = Vec::with_capacity(file_count as usize);
+    let mut members = Vec::with_capacity((file_count as usize).min(1024));
     let mut written = 0_u32;
     let mut skipped = 0_u32;
     let mut matched_only = false;
@@ -1209,8 +1239,7 @@ pub fn unpack_archive_opts(
         let mut path_len_buf = [0_u8; 4];
         reader.read_exact(&mut path_len_buf)?;
         let path_len = u32::from_le_bytes(path_len_buf) as usize;
-        let mut path_bytes = vec![0_u8; path_len];
-        reader.read_exact(&mut path_bytes)?;
+        let path_bytes = read_declared(&mut reader, path_len as u64, "pack member path")?;
         let member_path = String::from_utf8(path_bytes).context("pack member path is not UTF-8")?;
 
         let mut original_len_buf = [0_u8; 8];
@@ -1224,10 +1253,11 @@ pub fn unpack_archive_opts(
         reader.read_exact(&mut compressed_len_buf)?;
         let compressed_len = u64::from_le_bytes(compressed_len_buf);
 
-        let mut compressed = vec![0_u8; compressed_len as usize];
-        reader
-            .read_exact(&mut compressed)
-            .with_context(|| format!("reading compressed data for {member_path}"))?;
+        let compressed = read_declared(
+            &mut reader,
+            compressed_len,
+            &format!("compressed data for {member_path}"),
+        )?;
 
         if let Some(only) = &opts.only {
             if member_path != *only {
@@ -1317,7 +1347,8 @@ pub fn unpack_archive_opts(
 pub fn cat_member(archive: &Path, member: Option<&str>, mut writer: impl Write) -> Result<u64> {
     let version = peek_version(archive)?;
     if version == VERSION_V3 {
-        let member = member.ok_or_else(|| anyhow::anyhow!("member path is required for pack archives"))?;
+        let member =
+            member.ok_or_else(|| anyhow::anyhow!("member path is required for pack archives"))?;
         let data = extract_pack_member(archive, member)?;
         writer
             .write_all(&data)
@@ -1344,7 +1375,10 @@ pub fn extract_pack_member(archive: &Path, member_path: &str) -> Result<Vec<u8>>
     let mut version = [0_u8; 1];
     reader.read_exact(&mut version)?;
     if version[0] != VERSION_V3 {
-        bail!("expected pack archive version {VERSION_V3}, got {}", version[0]);
+        bail!(
+            "expected pack archive version {VERSION_V3}, got {}",
+            version[0]
+        );
     }
     let mut level_buf = [0_u8; 4];
     reader.read_exact(&mut level_buf)?;
@@ -1356,8 +1390,7 @@ pub fn extract_pack_member(archive: &Path, member_path: &str) -> Result<Vec<u8>>
         let mut path_len_buf = [0_u8; 4];
         reader.read_exact(&mut path_len_buf)?;
         let path_len = u32::from_le_bytes(path_len_buf) as usize;
-        let mut path_bytes = vec![0_u8; path_len];
-        reader.read_exact(&mut path_bytes)?;
+        let path_bytes = read_declared(&mut reader, path_len as u64, "pack member path")?;
         let path = String::from_utf8(path_bytes).context("pack member path is not UTF-8")?;
 
         let mut original_len_buf = [0_u8; 8];
@@ -1371,17 +1404,18 @@ pub fn extract_pack_member(archive: &Path, member_path: &str) -> Result<Vec<u8>>
         reader.read_exact(&mut compressed_len_buf)?;
         let compressed_len = u64::from_le_bytes(compressed_len_buf);
 
-        let mut compressed = vec![0_u8; compressed_len as usize];
-        reader
-            .read_exact(&mut compressed)
-            .with_context(|| format!("reading compressed data for {path}"))?;
+        let compressed = read_declared(
+            &mut reader,
+            compressed_len,
+            &format!("compressed data for {path}"),
+        )?;
 
         if path != member_path {
             continue;
         }
 
-        let plain = zstd_decompress_raw(&compressed)
-            .with_context(|| format!("decompressing {path}"))?;
+        let plain =
+            zstd_decompress_raw(&compressed).with_context(|| format!("decompressing {path}"))?;
         if plain.len() as u64 != original_len {
             bail!(
                 "size mismatch for {path}: expected {original_len}, got {}",
@@ -1949,8 +1983,7 @@ pub fn grep_archive(path: &Path, pattern: &str, max_size: u64) -> Result<GrepRes
             let mut path_len_buf = [0_u8; 4];
             reader.read_exact(&mut path_len_buf)?;
             let path_len = u32::from_le_bytes(path_len_buf) as usize;
-            let mut path_bytes = vec![0_u8; path_len];
-            reader.read_exact(&mut path_bytes)?;
+            let path_bytes = read_declared(&mut reader, path_len as u64, "pack member path")?;
             let member_path =
                 String::from_utf8(path_bytes).context("pack member path is not UTF-8")?;
 
@@ -1965,8 +1998,7 @@ pub fn grep_archive(path: &Path, pattern: &str, max_size: u64) -> Result<GrepRes
             reader.read_exact(&mut compressed_len_buf)?;
             let compressed_len = u64::from_le_bytes(compressed_len_buf);
 
-            let mut compressed = vec![0_u8; compressed_len as usize];
-            reader.read_exact(&mut compressed)?;
+            let compressed = read_declared(&mut reader, compressed_len, "pack member payload")?;
 
             if original_len > max_size {
                 members_skipped += 1;
@@ -2132,7 +2164,10 @@ pub fn repack_archive(
     let mut version = [0_u8; 1];
     reader.read_exact(&mut version)?;
     if version[0] != VERSION_V3 {
-        bail!("repack requires a v3 pack archive (got version {})", version[0]);
+        bail!(
+            "repack requires a v3 pack archive (got version {})",
+            version[0]
+        );
     }
     let mut level_buf = [0_u8; 4];
     reader.read_exact(&mut level_buf)?;
@@ -2150,8 +2185,7 @@ pub fn repack_archive(
         let mut path_len_buf = [0_u8; 4];
         reader.read_exact(&mut path_len_buf)?;
         let path_len = u32::from_le_bytes(path_len_buf) as usize;
-        let mut path_bytes = vec![0_u8; path_len];
-        reader.read_exact(&mut path_bytes)?;
+        let path_bytes = read_declared(&mut reader, path_len as u64, "pack member path")?;
         let member_path = String::from_utf8(path_bytes).context("pack member path is not UTF-8")?;
 
         let mut original_len_buf = [0_u8; 8];
@@ -2165,8 +2199,7 @@ pub fn repack_archive(
         reader.read_exact(&mut compressed_len_buf)?;
         let compressed_len = u64::from_le_bytes(compressed_len_buf);
 
-        let mut compressed = vec![0_u8; compressed_len as usize];
-        reader.read_exact(&mut compressed)?;
+        let compressed = read_declared(&mut reader, compressed_len, "pack member payload")?;
 
         if is_excluded(&member_path, &exclude_set) {
             excluded += 1;
@@ -3147,12 +3180,7 @@ mod tests {
         assert_eq!(inspect_pack(&input)?.file_count, 3);
 
         let output = temp.path().join("out.rzst");
-        let stats = repack_archive(
-            &input,
-            &output,
-            &["*.tmp".into(), "*.log".into()],
-            true,
-        )?;
+        let stats = repack_archive(&input, &output, &["*.tmp".into(), "*.log".into()], true)?;
         assert_eq!(stats.kept, 1);
         assert_eq!(stats.excluded, 2);
 
@@ -3162,6 +3190,41 @@ mod tests {
 
         let err = repack_archive(&input, &output, &["*.tmp".into()], false);
         assert!(err.is_err());
+        Ok(())
+    }
+
+    /// A hostile pack header can declare any member length. Before bounded
+    /// reads, a 69-byte archive claiming a 281 TB payload aborted the process
+    /// (`memory allocation of 281474976710655 bytes failed`) instead of
+    /// returning an error. Every entry point that parses v3 members must now
+    /// fail gracefully on absurd declared lengths.
+    #[test]
+    fn absurd_declared_lengths_error_instead_of_aborting() -> Result<()> {
+        let temp = tempdir()?;
+        let archive = temp.path().join("hostile.rzst");
+
+        // RZC1 | v3 | level | file_count=1 | path_len | path | original_len
+        // | sha256 | compressed_len = 281 TB, with no payload behind it.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(3);
+        bytes.extend_from_slice(&3_i32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&5_u32.to_le_bytes());
+        bytes.extend_from_slice(b"a.txt");
+        bytes.extend_from_slice(&100_u64.to_le_bytes());
+        bytes.extend_from_slice(&[0_u8; HASH_LEN]);
+        bytes.extend_from_slice(&0x0000_FFFF_FFFF_FFFF_u64.to_le_bytes());
+        fs::write(&archive, &bytes)?;
+
+        let dest = temp.path().join("out");
+        let err = unpack_archive(&archive, &dest, false).expect_err("unpack must reject");
+        assert!(
+            format!("{err:#}").contains("remain in the archive"),
+            "unexpected error: {err:#}"
+        );
+        assert!(list_archive(&archive).is_err(), "list must reject");
+        assert!(verify_file(&archive, None).is_err(), "verify must reject");
         Ok(())
     }
 
