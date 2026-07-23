@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.6.0] — 2026-07-22
+
+### Added
+- **zstd dictionaries** — `rzc dict train` trains a dictionary from a corpus of
+  at least 8 similar files (`--max-size` caps it); `--dictionary` applies it on
+  `compress` and `decompress` for far better ratios on many small files. The v2
+  container is unchanged — a dictionary-compressed payload is a standard zstd
+  frame — so the dictionary is not stored and must be retained to decode.
+- **Parallel recursive compress** — `compress --recursive` compresses independent
+  files across cores with rayon; output is sorted by path for stable results.
+- Library APIs: `compress_bytes_dict`, `compress_file_opts_dict`,
+  `decompress_reader_dict`, `decompress_file_opts_dict`, `decompress_to_path_dict`,
+  and the `dict` module (`train_dictionary`, `DEFAULT_MAX_DICT_SIZE`).
+
+### Fixed
+- **Denial of service on malformed pack archives** — every v3 member reader passed
+  an attacker-controlled length straight to `vec![0; declared]`. A 69-byte archive
+  declaring a 281 TB payload aborted the process (`memory allocation … failed`)
+  before any validation. Member blobs are now read through a bounded reader, so an
+  absurd length is an ordinary error; `list` also verifies it skipped a member's
+  full declared payload rather than reporting a truncated archive as valid.
+- CI is green again: 10 `rustfmt` violations and a `clippy::too_many_arguments`
+  error in `run_unpack` (present on `main`) are resolved.
+
+### Changed
+- Version **0.6.0**
+- Single-file v2 and pack v3 formats remain fully compatible
+
 ## [0.5.0] — 2026-07-21
 
 ### Added
