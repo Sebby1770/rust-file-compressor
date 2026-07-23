@@ -1,8 +1,8 @@
 [package]
 name = "rust-file-compressor"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
-description = "A fast Rust file compressor CLI with zstd compression, multi-file archives, integrity checks, and zip benchmarking."
+description = "A fast Rust file compressor CLI with zstd compression, multi-file archives, zstd dictionaries, parallel directory mode, integrity checks, and zip benchmarking."
 license = "MIT"
 readme = "README.md"
 keywords = ["compression", "zstd", "cli", "archive"]

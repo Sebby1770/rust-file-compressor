@@ -2,13 +2,15 @@
 
 `rzc` is a fast Rust command-line compressor. It stores data in a compact `.rzst` container and uses [zstd](https://facebook.github.io/zstd/) to beat classic `zip -9` on both speed and compression ratio for text-heavy inputs.
 
-**Version:** 0.5.0
+**Version:** 0.6.0
 
 ## Features
 
 - **Library + CLI** — core API in `rust_file_compressor`, binary `rzc`
 - **Single-file format v2** — RZC1 magic, version, level, original size, **SHA-256**
 - **Multi-file pack archives (v3)** — `pack` / `unpack` directory trees into one `.rzst`
+- **zstd dictionaries** — `dict train` builds a dictionary from a corpus of similar files; `--dictionary` uses it on compress/decompress for far better ratios on many small files
+- **Parallel directory mode** — recursive compress fans out across cores with [rayon](https://docs.rs/rayon)
 - **Selective unpack** — `--only path` and `--strip-components N`
 - **`cat` / `diff`** — stream one member to stdout; compare two archives by checksums
 - **Backward compatible** — still reads version 1 files (no checksum)
@@ -62,7 +64,21 @@ rzc compress data/ --recursive
 rzc compress data/ -r --exclude 'target' --exclude '*.git*'
 ```
 
-Recursive compress prints a **ratio table** (per file + TOTAL).
+Recursive compress prints a **ratio table** (per file + TOTAL) and compresses independent files in parallel across cores.
+
+### Dictionaries
+
+zstd dictionaries dramatically improve the ratio on many small, similar files (logs, JSON records, source trees). Train one from a corpus of at least 8 files, then use it on both sides:
+
+```sh
+rzc dict train samples/ -o corpus.dict
+rzc dict train samples/ -o corpus.dict --max-size 65536
+
+rzc compress record.json --dictionary corpus.dict
+rzc decompress record.json.rzst --dictionary corpus.dict
+```
+
+The dictionary is **not** stored in the container — keep it, or the data cannot be restored. Decompressing dictionary-compressed data without `--dictionary` fails with a hint naming the flag; the wrong dictionary reports a mismatch.
 
 ### Decompress
 
@@ -114,6 +130,9 @@ rzc verify bundle.rzst
 rzc doctor
 rzc doctor --json
 
+# Train a dictionary from a corpus
+rzc dict train samples/ -o corpus.dict
+
 # Shell completions
 rzc completions bash > /etc/bash_completion.d/rzc
 rzc completions zsh > ~/.zfunc/_rzc
@@ -157,6 +176,8 @@ rzc bench large.txt --json
 | `--exclude GLOB` | compress `-r`, pack | Skip matching paths (repeatable) |
 | `--newer-than DAYS` | pack | Only files modified in the last N days |
 | `--dry-run` | compress | Estimate size without writing |
+| `--dictionary FILE` | compress, decompress | Trained zstd dictionary to use |
+| `--max-size N` | dict train | Maximum dictionary size in bytes (default 112640) |
 | `--force` | compress, pack, unpack | Overwrite existing outputs |
 | `--skip-existing` | decompress, unpack | Do not overwrite existing files |
 | `--only PATH` | unpack | Extract a single member |
