@@ -4,6 +4,8 @@
 //! integrity checking (SHA-256), multi-file pack archives (format v3),
 //! and helpers for CLI tooling.
 
+pub mod dict;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
@@ -494,9 +496,25 @@ pub fn compress_reader(
 /// Compress an in-memory buffer into the v2 `.rzst` format.
 pub fn compress_bytes(
     data: &[u8],
+    writer: impl Write,
+    level: i32,
+    threads: u32,
+    progress: Option<&ProgressFn<'_>>,
+) -> Result<u64> {
+    compress_bytes_dict(data, writer, level, threads, None, progress)
+}
+
+/// Compress an in-memory buffer, optionally with a trained zstd dictionary.
+///
+/// The v2 container is unchanged: a dictionary-compressed payload is still a
+/// standard zstd frame, it simply needs the same dictionary to decode. The
+/// dictionary is deliberately not stored in the container — see `rzc dict`.
+pub fn compress_bytes_dict(
+    data: &[u8],
     mut writer: impl Write,
     level: i32,
     threads: u32,
+    dictionary: Option<&[u8]>,
     progress: Option<&ProgressFn<'_>>,
 ) -> Result<u64> {
     let original_len = data.len() as u64;
@@ -504,8 +522,12 @@ pub fn compress_bytes(
 
     write_header_v2(&mut writer, level, original_len, checksum)?;
 
-    let mut encoder = zstd::stream::Encoder::new(writer, level)
-        .with_context(|| format!("creating zstd encoder at level {level}"))?;
+    let mut encoder = match dictionary {
+        Some(dict) => zstd::stream::Encoder::with_dictionary(writer, level, dict)
+            .with_context(|| format!("creating zstd encoder with dictionary at level {level}"))?,
+        None => zstd::stream::Encoder::new(writer, level)
+            .with_context(|| format!("creating zstd encoder at level {level}"))?,
+    };
     if threads > 1 {
         encoder
             .multithread(threads)
@@ -532,6 +554,28 @@ fn zstd_compress_raw(data: &[u8], level: i32, threads: u32) -> Result<Vec<u8>> {
     encoder.write_all(data).context("writing to zstd encoder")?;
     encoder.finish().context("finishing zstd frame")?;
     Ok(out)
+}
+
+/// Attach dictionary-aware guidance to a zstd decode failure.
+///
+/// A dictionary-compressed payload is an ordinary zstd frame, so decoding it
+/// without the dictionary fails deep inside zstd with an opaque message. Name
+/// the actual fix instead.
+fn annotate_decode_error(err: io::Error, had_dict: bool) -> anyhow::Error {
+    let mismatch = err.to_string().contains("Dictionary mismatch");
+    let err = anyhow::Error::new(err);
+    if had_dict && mismatch {
+        err.context(
+            "dictionary mismatch: this file was not compressed with the supplied dictionary",
+        )
+    } else if had_dict {
+        err.context("decompressing data")
+    } else {
+        err.context(
+            "decompression failed — if this file was compressed with a trained dictionary, \
+             pass --dictionary <file>",
+        )
+    }
 }
 
 /// Read a blob whose length was declared by an archive header.
@@ -628,6 +672,20 @@ pub fn compress_file_opts(
     force: bool,
     progress: Option<&ProgressFn<'_>>,
 ) -> Result<IoStats> {
+    compress_file_opts_dict(input, output, level, threads, force, None, progress)
+}
+
+/// Compress a file, optionally with a trained zstd dictionary.
+#[allow(clippy::too_many_arguments)]
+pub fn compress_file_opts_dict(
+    input: &Path,
+    output: &Path,
+    level: i32,
+    threads: u32,
+    force: bool,
+    dictionary: Option<&[u8]>,
+    progress: Option<&ProgressFn<'_>>,
+) -> Result<IoStats> {
     if output.exists() && !force {
         bail!(
             "output already exists: {} (use --force to overwrite)",
@@ -643,7 +701,7 @@ pub fn compress_file_opts(
     let out_file =
         File::create(output).with_context(|| format!("creating output {}", output.display()))?;
     let writer = BufWriter::new(out_file);
-    compress_bytes(&data, writer, level, threads, progress)?;
+    compress_bytes_dict(&data, writer, level, threads, dictionary, progress)?;
 
     let output_bytes = fs::metadata(output)
         .with_context(|| format!("reading metadata for {}", output.display()))?
@@ -692,12 +750,30 @@ pub fn compress_to_path(
 ///
 /// Returns the number of decompressed bytes written.
 pub fn decompress_reader(
+    reader: impl Read,
+    writer: impl Write,
+    progress: Option<&ProgressFn<'_>>,
+) -> Result<u64> {
+    decompress_reader_dict(reader, writer, None, progress)
+}
+
+/// Decompress a `.rzst` stream, optionally with the trained zstd dictionary the
+/// payload was compressed with.
+///
+/// Dictionary-compressed data cannot be restored without its dictionary; the
+/// error names `--dictionary` so the fix is obvious.
+pub fn decompress_reader_dict(
     mut reader: impl Read,
     mut writer: impl Write,
+    dictionary: Option<&[u8]>,
     progress: Option<&ProgressFn<'_>>,
 ) -> Result<u64> {
     let header = read_header(&mut reader)?;
-    let mut decoder = zstd::stream::Decoder::new(reader).context("creating zstd decoder")?;
+    let mut decoder = match dictionary {
+        Some(dict) => zstd::stream::Decoder::with_dictionary(BufReader::new(reader), dict)
+            .context("creating zstd decoder with dictionary")?,
+        None => zstd::stream::Decoder::new(reader).context("creating zstd decoder")?,
+    };
 
     // Hash while decompressing so we can verify integrity without a second pass.
     let mut hasher = Sha256::new();
@@ -706,7 +782,9 @@ pub fn decompress_reader(
     let mut buf = [0_u8; 64 * 1024];
 
     loop {
-        let n = decoder.read(&mut buf).context("decompressing data")?;
+        let n = decoder
+            .read(&mut buf)
+            .map_err(|err| annotate_decode_error(err, dictionary.is_some()))?;
         if n == 0 {
             break;
         }
@@ -759,6 +837,17 @@ pub fn decompress_file_opts(
     skip_existing: bool,
     progress: Option<&ProgressFn<'_>>,
 ) -> Result<IoStats> {
+    decompress_file_opts_dict(input, output, skip_existing, None, progress)
+}
+
+/// Decompress a file, optionally with the dictionary it was compressed with.
+pub fn decompress_file_opts_dict(
+    input: &Path,
+    output: &Path,
+    skip_existing: bool,
+    dictionary: Option<&[u8]>,
+    progress: Option<&ProgressFn<'_>>,
+) -> Result<IoStats> {
     if skip_existing && output.exists() {
         let input_bytes = fs::metadata(input)
             .with_context(|| format!("reading metadata for {}", input.display()))?
@@ -786,7 +875,7 @@ pub fn decompress_file_opts(
         File::create(output).with_context(|| format!("creating output {}", output.display()))?;
     let writer = BufWriter::new(out_file);
 
-    let output_bytes = decompress_reader(reader, writer, progress)?;
+    let output_bytes = decompress_reader_dict(reader, writer, dictionary, progress)?;
 
     Ok(IoStats {
         input_bytes,
@@ -801,11 +890,21 @@ pub fn decompress_to_path(
     output: &Path,
     progress: Option<&ProgressFn<'_>>,
 ) -> Result<IoStats> {
+    decompress_to_path_dict(reader, output, None, progress)
+}
+
+/// Decompress a `Read` into a path, optionally with a trained zstd dictionary.
+pub fn decompress_to_path_dict(
+    reader: impl Read,
+    output: &Path,
+    dictionary: Option<&[u8]>,
+    progress: Option<&ProgressFn<'_>>,
+) -> Result<IoStats> {
     ensure_parent_dir(output)?;
     let writer = BufWriter::new(
         File::create(output).with_context(|| format!("creating output {}", output.display()))?,
     );
-    let output_bytes = decompress_reader(reader, writer, progress)?;
+    let output_bytes = decompress_reader_dict(reader, writer, dictionary, progress)?;
     Ok(IoStats {
         input_bytes: 0,
         output_bytes,
@@ -1675,7 +1774,10 @@ pub fn compress_dir_recursive_ex(
     }
 
     let exclude_set = build_exclude_set(excludes)?;
-    let mut results = Vec::new();
+
+    // Pass 1: walk the tree (inherently sequential) and gather the work list,
+    // skipping directories, existing .rzst outputs, and excluded paths.
+    let mut targets: Vec<(PathBuf, PathBuf)> = Vec::new();
     for entry in WalkDir::new(dir).follow_links(false) {
         let entry = entry.with_context(|| format!("walking {}", dir.display()))?;
         if !entry.file_type().is_file() {
@@ -1702,19 +1804,38 @@ pub fn compress_dir_recursive_ex(
             continue;
         }
 
-        let output = append_suffix(path, ".rzst");
-        if dry_run {
-            let dry = compress_file_dry_run(path, level, threads)?;
-            results.push(IoStats {
-                input_bytes: dry.input_bytes,
-                output_bytes: dry.estimated_compressed_bytes,
-                output_path: output,
-            });
-        } else {
-            let stats = compress_file(path, &output, level, threads, progress)?;
-            results.push(stats);
-        }
+        targets.push((path.to_path_buf(), append_suffix(path, ".rzst")));
     }
+
+    // Pass 2: compress independent files in parallel (rayon). Each file gets a
+    // single zstd worker since parallelism is already across files. The
+    // progress callback is not Sync, so — like pack — it is reported only at
+    // the boundaries, not per file.
+    let total = targets.len() as u64;
+    if let Some(cb) = progress {
+        cb(0, total);
+    }
+    let mut results: Vec<IoStats> = targets
+        .par_iter()
+        .map(|(path, output)| -> Result<IoStats> {
+            if dry_run {
+                let dry = compress_file_dry_run(path, level, threads)?;
+                Ok(IoStats {
+                    input_bytes: dry.input_bytes,
+                    output_bytes: dry.estimated_compressed_bytes,
+                    output_path: output.clone(),
+                })
+            } else {
+                compress_file(path, output, level, 1, None)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(cb) = progress {
+        cb(total, total);
+    }
+
+    // Sort by output path so results do not depend on rayon's scheduling.
+    results.sort_by(|a, b| a.output_path.cmp(&b.output_path));
     Ok(results)
 }
 
@@ -3190,6 +3311,57 @@ mod tests {
 
         let err = repack_archive(&input, &output, &["*.tmp".into()], false);
         assert!(err.is_err());
+        Ok(())
+    }
+
+    /// A dictionary-compressed payload is a normal v2 container that simply
+    /// needs its dictionary to decode: it roundtrips with the dictionary,
+    /// fails with an actionable hint without one, and reports a mismatch with
+    /// the wrong one.
+    #[test]
+    fn dictionary_compress_decompress_roundtrip() -> Result<()> {
+        // Train on many small, similar records so the dictionary is meaningful.
+        let temp = tempdir()?;
+        let mut sample_paths = Vec::new();
+        for i in 0..16 {
+            let path = temp.path().join(format!("rec{i}.json"));
+            fs::write(
+                &path,
+                format!("{{\"id\":{i},\"kind\":\"event\",\"service\":\"auth\",\"ok\":true}}"),
+            )?;
+            sample_paths.push(path);
+        }
+        let dict = dict::train_dictionary(&sample_paths, 4096)?;
+
+        let payload = b"{\"id\":99,\"kind\":\"event\",\"service\":\"auth\",\"ok\":true}";
+        let mut compressed = Vec::new();
+        compress_bytes_dict(payload, &mut compressed, 12, 1, Some(&dict), None)?;
+
+        // Correct dictionary restores the bytes.
+        let mut restored = Vec::new();
+        decompress_reader_dict(Cursor::new(&compressed), &mut restored, Some(&dict), None)?;
+        assert_eq!(restored, payload);
+
+        // No dictionary: fails with the actionable hint.
+        let err = decompress_reader_dict(Cursor::new(&compressed), io::sink(), None, None)
+            .expect_err("decoding without the dictionary should fail");
+        assert!(
+            format!("{err:#}").contains("pass --dictionary"),
+            "unexpected error: {err:#}"
+        );
+
+        // Wrong dictionary: reports a mismatch.
+        let wrong = dict::train_dictionary(&sample_paths, 2048)?;
+        if wrong != dict {
+            let err =
+                decompress_reader_dict(Cursor::new(&compressed), io::sink(), Some(&wrong), None)
+                    .expect_err("decoding with the wrong dictionary should fail");
+            assert!(
+                format!("{err:#}").contains("mismatch")
+                    || format!("{err:#}").contains("pass --dictionary"),
+                "unexpected error: {err:#}"
+            );
+        }
         Ok(())
     }
 

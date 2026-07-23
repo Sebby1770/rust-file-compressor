@@ -10,15 +10,16 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use indicatif::{ProgressBar, ProgressStyle};
+use rust_file_compressor::dict::{train_dictionary, DEFAULT_MAX_DICT_SIZE};
 use rust_file_compressor::{
-    append_suffix, archive_tree, bytes_per_second, cat_member, check_seal, compress_bytes,
-    compress_dir_recursive_ex, compress_file_dry_run, compress_file_opts, compress_to_path,
-    decompress_dir_recursive_ex, decompress_file_opts, decompress_reader, decompress_to_path,
-    default_decompressed_path, diff_archives, display_bytes, doctor, grep_archive, inspect_file,
-    is_stdio_path, list_archive, pack_directory_opts, ratio_percent, repack_archive,
-    resolve_threads, seal_archive, unpack_archive_opts, verify_file, ArchiveInfo, DiffResult,
-    DiffStatus, IoStats, ListResult, PackInfo, PackOpts, Preset, UnpackOpts, DEFAULT_GREP_MAX_SIZE,
-    DEFAULT_LEVEL,
+    append_suffix, archive_tree, bytes_per_second, cat_member, check_seal, compress_bytes_dict,
+    compress_dir_recursive_ex, compress_file_dry_run, compress_file_opts_dict, compress_to_path,
+    decompress_dir_recursive_ex, decompress_file_opts_dict, decompress_reader_dict,
+    decompress_to_path_dict, default_decompressed_path, diff_archives, display_bytes, doctor,
+    grep_archive, inspect_file, is_stdio_path, list_archive, pack_directory_opts, ratio_percent,
+    repack_archive, resolve_threads, seal_archive, unpack_archive_opts, verify_file, ArchiveInfo,
+    DiffResult, DiffStatus, IoStats, ListResult, PackInfo, PackOpts, Preset, UnpackOpts,
+    DEFAULT_GREP_MAX_SIZE, DEFAULT_LEVEL,
 };
 use serde::Serialize;
 
@@ -93,6 +94,10 @@ enum Commands {
         /// Overwrite existing output files.
         #[arg(long)]
         force: bool,
+
+        /// Path to a trained zstd dictionary (see `rzc dict train`).
+        #[arg(long, value_name = "FILE")]
+        dictionary: Option<PathBuf>,
     },
 
     /// Decompress a .rzst file (or directory with --recursive).
@@ -115,6 +120,16 @@ enum Commands {
         /// Overwrite existing output files (default behaviour when not skipping).
         #[arg(long)]
         force: bool,
+
+        /// Path to the trained zstd dictionary the input was compressed with.
+        #[arg(long, value_name = "FILE")]
+        dictionary: Option<PathBuf>,
+    },
+
+    /// Train and manage zstd dictionaries.
+    Dict {
+        #[command(subcommand)]
+        command: DictCommands,
     },
 
     /// Pack a directory into a multi-file v3 archive.
@@ -338,6 +353,23 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum DictCommands {
+    /// Train a dictionary from sample files (or directories of files).
+    Train {
+        /// Sample files and/or directories (at least 8 regular files).
+        inputs: Vec<PathBuf>,
+
+        /// Output dictionary path.
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Maximum dictionary size in bytes.
+        #[arg(long, default_value_t = DEFAULT_MAX_DICT_SIZE)]
+        max_size: usize,
+    },
+}
+
 #[derive(Debug)]
 struct TimedStats {
     output_bytes: u64,
@@ -374,9 +406,11 @@ fn main() -> Result<()> {
             dry_run,
             excludes,
             force,
+            dictionary,
         } => {
             let level = resolve_level(level, preset);
             let threads = resolve_threads(threads);
+            let dict = load_dictionary(dictionary.as_deref())?;
             run_compress(
                 &input,
                 output.as_deref(),
@@ -385,6 +419,7 @@ fn main() -> Result<()> {
                 recursive,
                 dry_run,
                 &excludes,
+                dict.as_deref(),
                 force,
                 quiet,
             )?;
@@ -395,13 +430,16 @@ fn main() -> Result<()> {
             recursive,
             skip_existing,
             force,
+            dictionary,
         } => {
+            let dict = load_dictionary(dictionary.as_deref())?;
             run_decompress(
                 &input,
                 output.as_deref(),
                 recursive,
                 skip_existing,
                 force,
+                dict.as_deref(),
                 quiet,
             )?;
         }
@@ -447,6 +485,15 @@ fn main() -> Result<()> {
             };
             run_unpack(&input, output.as_deref(), &opts, json, quiet)?;
         }
+        Commands::Dict { command } => match command {
+            DictCommands::Train {
+                inputs,
+                output,
+                max_size,
+            } => {
+                run_dict_train(&inputs, &output, max_size, quiet)?;
+            }
+        },
         Commands::Cat { archive, member } => {
             run_cat(&archive, member.as_deref(), quiet)?;
         }
@@ -537,10 +584,14 @@ fn run_compress(
     recursive: bool,
     dry_run: bool,
     excludes: &[String],
+    dictionary: Option<&[u8]>,
     force: bool,
     quiet: bool,
 ) -> Result<()> {
     let _ = quiet;
+    if dictionary.is_some() && (recursive || dry_run) {
+        bail!("--dictionary is not supported with --recursive or --dry-run");
+    }
     if recursive {
         if is_stdio_path(input) {
             bail!("--recursive cannot be used with stdin (-)");
@@ -581,7 +632,7 @@ fn run_compress(
                 .read_to_end(&mut data)
                 .context("reading stdin")?;
             let mut sink = rust_file_compressor::CountingSink::default();
-            compress_bytes(&data, &mut sink, level, threads, None)?;
+            compress_bytes_dict(&data, &mut sink, level, threads, None, None)?;
             println!("Dry-run (stdin)");
             println!(
                 "Input:  {} ({})",
@@ -644,7 +695,7 @@ fn run_compress(
         let data = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
         let start = Instant::now();
         let mut stdout = io::stdout().lock();
-        compress_bytes(&data, &mut stdout, level, threads, None)?;
+        compress_bytes_dict(&data, &mut stdout, level, threads, dictionary, None)?;
         stdout.flush()?;
         eprintln!(
             "Compressed {} -> stdout in {:.3}s",
@@ -676,12 +727,56 @@ fn run_compress(
         .map(|f| f as &rust_file_compressor::ProgressFn<'_>);
 
     let start = Instant::now();
-    let stats = compress_file_opts(input, &output_path, level, threads, force, progress_ref)?;
+    let stats = compress_file_opts_dict(
+        input,
+        &output_path,
+        level,
+        threads,
+        force,
+        dictionary,
+        progress_ref,
+    )?;
     let elapsed = start.elapsed();
     if let Some(bar) = pb {
         bar.finish_and_clear();
     }
     print_compress_stats(&stats, elapsed, true);
+    Ok(())
+}
+
+/// Read a trained dictionary from disk, if one was requested.
+fn load_dictionary(path: Option<&Path>) -> Result<Option<Vec<u8>>> {
+    match path {
+        None => Ok(None),
+        Some(path) => {
+            let bytes =
+                fs::read(path).with_context(|| format!("reading dictionary {}", path.display()))?;
+            if bytes.is_empty() {
+                bail!("dictionary {} is empty", path.display());
+            }
+            Ok(Some(bytes))
+        }
+    }
+}
+
+/// Train a zstd dictionary from a corpus of sample files.
+fn run_dict_train(inputs: &[PathBuf], output: &Path, max_size: usize, quiet: bool) -> Result<()> {
+    if inputs.is_empty() {
+        bail!("dictionary training needs at least one sample file or directory");
+    }
+    let start = Instant::now();
+    let dictionary = train_dictionary(inputs, max_size)?;
+    fs::write(output, &dictionary)
+        .with_context(|| format!("writing dictionary {}", output.display()))?;
+    if !quiet {
+        println!(
+            "Trained {} dictionary in {:.3}s",
+            display_bytes(dictionary.len() as u64),
+            start.elapsed().as_secs_f64()
+        );
+        println!("Output: {}", output.display());
+        println!("Keep this file: dictionary-compressed data cannot be restored without it.");
+    }
     Ok(())
 }
 
@@ -723,7 +818,7 @@ fn compress_stdio_to_stdio(level: i32, threads: u32) -> Result<()> {
         .read_to_end(&mut data)
         .context("reading stdin")?;
     let mut stdout = io::stdout().lock();
-    compress_bytes(&data, &mut stdout, level, threads, None)?;
+    compress_bytes_dict(&data, &mut stdout, level, threads, None, None)?;
     stdout.flush()?;
     eprintln!(
         "Compressed {} from stdin -> stdout",
@@ -738,9 +833,13 @@ fn run_decompress(
     recursive: bool,
     skip_existing: bool,
     force: bool,
+    dictionary: Option<&[u8]>,
     quiet: bool,
 ) -> Result<()> {
     let _ = (force, quiet); // decompress overwrites unless --skip-existing
+    if recursive && dictionary.is_some() {
+        bail!("--dictionary is not supported with --recursive");
+    }
     if recursive {
         if is_stdio_path(input) {
             bail!("--recursive cannot be used with stdin (-)");
@@ -785,11 +884,12 @@ fn run_decompress(
         let mut reader = BufReader::new(io::stdin().lock());
         if let Some(path) = output.filter(|p| !is_stdio_path(p)) {
             let start = Instant::now();
-            let stats = decompress_to_path(reader, path, None)?;
+            let stats = decompress_to_path_dict(reader, path, dictionary, None)?;
             print_decompress_stats(&stats, start.elapsed(), true);
         } else {
             let start = Instant::now();
-            let written = decompress_reader(&mut reader, io::stdout().lock(), None)?;
+            let written =
+                decompress_reader_dict(&mut reader, io::stdout().lock(), dictionary, None)?;
             eprintln!(
                 "Decompressed stdin -> stdout ({} in {:.3}s)",
                 display_bytes(written),
@@ -805,7 +905,8 @@ fn run_decompress(
         }
         let file = File::open(input).with_context(|| format!("opening {}", input.display()))?;
         let start = Instant::now();
-        let written = decompress_reader(BufReader::new(file), io::stdout().lock(), None)?;
+        let written =
+            decompress_reader_dict(BufReader::new(file), io::stdout().lock(), dictionary, None)?;
         eprintln!(
             "Decompressed {} -> stdout ({} in {:.3}s)",
             input.display(),
@@ -841,7 +942,8 @@ fn run_decompress(
         .map(|f| f as &rust_file_compressor::ProgressFn<'_>);
 
     let start = Instant::now();
-    let stats = decompress_file_opts(input, &output_path, skip_existing, progress_ref)?;
+    let stats =
+        decompress_file_opts_dict(input, &output_path, skip_existing, dictionary, progress_ref)?;
     let elapsed = start.elapsed();
     if let Some(bar) = pb {
         bar.finish_and_clear();
@@ -1454,7 +1556,7 @@ fn run_benchmark(
 
 fn timed_compress(input: &Path, output: &Path, level: i32, threads: u32) -> Result<TimedStats> {
     let start = Instant::now();
-    let stats = compress_file_opts(input, output, level, threads, true, None)?;
+    let stats = compress_file_opts_dict(input, output, level, threads, true, None, None)?;
     let elapsed = start.elapsed();
     Ok(TimedStats {
         output_bytes: stats.output_bytes,
